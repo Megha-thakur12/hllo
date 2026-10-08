@@ -1,14 +1,85 @@
 // ═══════════════════════════════════════════════════════════
 //  Vibration / Predictive Maintenance widget
-//  Telemetry interval: 5 minutes
+//  - 5-minute telemetry cadence
+//  - Data ALWAYS stays on screen: live → REST history → local cache
 // ═══════════════════════════════════════════════════════════
 
+const DATA_INTERVAL_MS = 5 * 60 * 1000;                     // telemetry every 5 min
+const STALE_AFTER_MS   = 2 * DATA_INTERVAL_MS + 60 * 1000;  // ~11 min => stale
+const HISTORY_RANGE_MS = 7 * 24 * 3600 * 1000;              // look back up to 7 days
+const HISTORY_LIMIT    = 300;                               // latest 300 points per key (~25 h)
+const CACHE_TAIL       = 72;                                // points per key kept in localStorage (~6 h)
+
+// ───────────── cache helpers ─────────────
+function cacheKey() {
+  const ds = self.ctx.datasources && self.ctx.datasources[0];
+  return 'vib_cache_' + (ds && ds.entityId ? ds.entityId : self.ctx.widget && self.ctx.widget.id || 'w');
+}
+
+function loadCache() {
+  try {
+    const raw = localStorage.getItem(cacheKey());
+    return raw ? JSON.parse(raw) : {};
+  } catch (e) { return {}; }
+}
+
+function saveCache(map) {
+  try {
+    const out = {};
+    Object.keys(map).forEach(k => {
+      if (map[k] && map[k].length) out[k] = map[k].slice(-CACHE_TAIL);
+    });
+    localStorage.setItem(cacheKey(), JSON.stringify(out));
+  } catch (e) { /* storage full or blocked: ignore */ }
+}
+
+// ───────────── REST history fallback ─────────────
+function fetchHistory(force) {
+  const now = Date.now();
+  if (self.ctx._fetching) return;
+  if (!force && self.ctx._lastFetch && now - self.ctx._lastFetch < DATA_INTERVAL_MS) return;
+
+  const ds = self.ctx.datasources && self.ctx.datasources[0];
+  if (!ds || !ds.entityId || !ds.entityType || !self.ctx.http) return;
+
+  const keys = (ds.dataKeys || []).map(k => k.name).filter(Boolean);
+  if (!keys.length) return;
+
+  self.ctx._fetching = true;
+  self.ctx._lastFetch = now;
+
+  const url = `/api/plugins/telemetry/${ds.entityType}/${ds.entityId}/values/timeseries` +
+    `?keys=${encodeURIComponent(keys.join(','))}` +
+    `&startTs=${now - HISTORY_RANGE_MS}&endTs=${now}` +
+    `&limit=${HISTORY_LIMIT}&agg=NONE&orderBy=DESC&useStrictDataTypes=false`;
+
+  self.ctx.http.get(url).subscribe(
+    resp => {
+      self.ctx._fetching = false;
+      const map = {};
+      Object.keys(resp || {}).forEach(k => {
+        map[k] = (resp[k] || [])
+          .filter(p => p && p.value !== null && p.value !== undefined && p.value !== '' && !isNaN(Number(p.value)))
+          .map(p => [p.ts, Number(p.value)])
+          .sort((a, b) => a[0] - b[0]);
+      });
+      self.ctx._fallback = map;
+      console.log('[Vibration widget] history loaded:',
+        Object.keys(map).map(k => `${k} → ${map[k].length} pts`));
+      self.onDataUpdated();            // re-render with the fetched history
+    },
+    err => {
+      self.ctx._fetching = false;
+      console.warn('[Vibration widget] history fetch failed:', err);
+    }
+  );
+}
+
+// ═══════════════════════════════════════════════════════════
 self.onInit = function () {
 
-  const DATA_INTERVAL_MS = 5 * 60 * 1000;                     // telemetry every 5 min
-  const STALE_AFTER_MS   = 2 * DATA_INTERVAL_MS + 60 * 1000;  // ~11 min => stale
-
   if (!self.ctx._rulState) self.ctx._rulState = { pRul: null };
+  self.ctx._cache = loadCache();       // last known data from previous sessions
 
   function pad(n) { return n < 10 ? '0' + n : '' + n; }
 
@@ -24,7 +95,7 @@ self.onInit = function () {
     const pCD = document.getElementById('pCD');
 
     if (!last) {
-      const msg = self.ctx._gotKeys ? 'No telemetry in selected timewindow' : 'Waiting for data…';
+      const msg = self.ctx._gotKeys ? 'No telemetry found for this device' : 'Waiting for data…';
       if (lastSync) { lastSync.textContent = msg; lastSync.style.color = '#94a3b8'; }
       if (pCD) pCD.textContent = msg;
       return;
@@ -32,9 +103,12 @@ self.onInit = function () {
 
     const age = now - last;
     const stale = age > STALE_AFTER_MS;
+    const lastKnown = self.ctx._source && self.ctx._source !== 'live';
 
     if (lastSync) {
-      lastSync.textContent = (stale ? 'Data stale · last: ' : 'Last data: ') + new Date(last).toLocaleString();
+      let label = stale ? 'Data stale · last: ' : 'Last data: ';
+      if (lastKnown) label = 'Showing last known data · ';
+      lastSync.textContent = label + new Date(last).toLocaleString();
       lastSync.style.color = stale ? '#ef4444' : '';
     }
 
@@ -46,7 +120,7 @@ self.onInit = function () {
       } else if (!stale) {
         pCD.textContent = 'Waiting for new data…';
       } else {
-        pCD.textContent = 'No new data (stale)';
+        pCD.textContent = 'No new data (device offline?)';
       }
     }
   };
@@ -54,6 +128,12 @@ self.onInit = function () {
   if (self.ctx._clockTimer) clearInterval(self.ctx._clockTimer);
   self.ctx._clockTimer = setInterval(self.ctx._updateStatus, 1000);
   self.ctx._updateStatus();
+
+  // Draw cached data immediately, then try to refresh from the server
+  if (Object.keys(self.ctx._cache).length) {
+    setTimeout(() => self.onDataUpdated(), 0);
+  }
+  setTimeout(() => fetchHistory(true), 500);
 };
 
 self.onDestroy = function () {
@@ -63,64 +143,89 @@ self.onDestroy = function () {
   }
 };
 
+// ═══════════════════════════════════════════════════════════
 self.onDataUpdated = function () {
 
-  const data = self.ctx.data;
-  if (!data || !data.length) return;
+  const liveData = self.ctx.data || [];
+  if (!liveData.length && !Object.keys(self.ctx._cache || {}).length) return;
   self.ctx._gotKeys = true;
 
   // ─────────────────────────────────────
-  // 0. CLEAN DATA + DIAGNOSTICS
+  // 0. BUILD DATA: live → history → cache (per key)
   // ─────────────────────────────────────
-  const result = data.map(item => {
-    const rows = item.data
-      ? item.data
-          .filter(e => e && e[1] !== null && e[1] !== undefined && e[1] !== '' && !isNaN(Number(e[1])))
-          .map(e => [e[0], Number(e[1])])
-      : [];
-    return { name: item.dataKey.name || item.dataKey.label, data: rows };
+  const clean = rows => (rows || [])
+    .filter(e => e && e[1] !== null && e[1] !== undefined && e[1] !== '' && !isNaN(Number(e[1])))
+    .map(e => [e[0], Number(e[1])]);
+
+  const fallback = self.ctx._fallback || {};
+  const cache = self.ctx._cache || {};
+
+  const keyNames = liveData.length
+    ? liveData.map(d => d.dataKey.name || d.dataKey.label)
+    : Object.keys(cache);
+
+  let liveCount = 0, fbCount = 0, cacheCount = 0;
+
+  const result = keyNames.map(name => {
+    const item = liveData.find(d => (d.dataKey.name || d.dataKey.label) === name);
+    const live = item ? clean(item.data) : [];
+    if (live.length) { liveCount++; return { name, data: live }; }
+    if (fallback[name] && fallback[name].length) { fbCount++; return { name, data: fallback[name] }; }
+    if (cache[name] && cache[name].length) { cacheCount++; return { name, data: cache[name] }; }
+    return { name, data: [] };
   });
+
+  self.ctx._source = liveCount > 0 && fbCount === 0 && cacheCount === 0 ? 'live'
+                   : liveCount > 0 ? 'mixed'
+                   : fbCount > 0 ? 'history'
+                   : cacheCount > 0 ? 'cache' : 'none';
+
+  // Live window empty → ask the server for the last known values
+  if (liveCount === 0) fetchHistory(false);
 
   // Normalised lookup: ignore case, underscores, spaces, dashes
   const norm = s => String(s).toLowerCase().replace(/[^a-z0-9]/g, '');
   const keyIndex = {};
   result.forEach(r => { keyIndex[norm(r.name)] = r; });
 
-  // Log keys once, and again whenever the set of keys changes
-  const keySig = result.map(r => r.name + ':' + r.data.length).join('|');
+  const keySig = result.map(r => r.name + ':' + r.data.length).join('|') + '|' + self.ctx._source;
   if (self.ctx._keySig !== keySig) {
     self.ctx._keySig = keySig;
-    console.log('[Vibration widget] keys received:',
+    console.log(`[Vibration widget] source=${self.ctx._source}; keys:`,
       result.map(r => `${r.name} → ${r.data.length} pts`));
   }
 
   // ─────────────────────────────────────
-  // 0b. NEW-DATA DETECTION (5-min cadence)
+  // 0b. NEW-DATA DETECTION
   // ─────────────────────────────────────
   let newestTs = 0;
-  result.forEach(r => {
-    r.data.forEach(d => { if (d[0] > newestTs) newestTs = d[0]; });
-  });
+  result.forEach(r => r.data.forEach(d => { if (d[0] > newestTs) newestTs = d[0]; }));
 
   const prevTs = self.ctx._lastDataTs || null;
   const chartExists = !!document.querySelector('#waveChart .js-plotly-plot, #waveChart.js-plotly-plot');
+  const sourceChanged = self.ctx._renderedSource !== self.ctx._source;
 
   if (newestTs) {
-    // Same sample as last render and charts already drawn → nothing to redraw
-    if (prevTs === newestTs && chartExists) {
+    if (prevTs === newestTs && chartExists && !sourceChanged) {
       if (self.ctx._updateStatus) self.ctx._updateStatus();
       return;
     }
     self.ctx._lastDataTs = newestTs;
   } else {
-    // No points at all: render the empty state once, then stay quiet
     if (self.ctx._emptyRendered && chartExists) {
       if (self.ctx._updateStatus) self.ctx._updateStatus();
       return;
     }
     self.ctx._emptyRendered = true;
-    console.warn('[Vibration widget] keys arrived but contain 0 points. ' +
-      'Check the timewindow (use Realtime – last 24 hours) and that the device is sending telemetry.');
+  }
+  self.ctx._renderedSource = self.ctx._source;
+
+  // Save the latest good data for next time (live or history only)
+  if (newestTs && self.ctx._source !== 'cache') {
+    const toSave = {};
+    result.forEach(r => { toSave[r.name] = r.data; });
+    self.ctx._cache = toSave;
+    saveCache(toSave);
   }
 
   // ─────────────────────────────────────
@@ -128,7 +233,6 @@ self.onDataUpdated = function () {
   // ─────────────────────────────────────
   const missingKeys = new Set();
 
-  // Find a series by one name or a list of candidate names
   function getSeries(names) {
     const list = Array.isArray(names) ? names : [names];
     for (const n of list) {
@@ -159,7 +263,6 @@ self.onDataUpdated = function () {
     return v !== null ? v > 0 : null;
   }
 
-  // Returns a list of candidate key names (first = canonical)
   function getKeyName(axis, metric) {
     const A = axis.toUpperCase();
     const a = axis.toLowerCase();
@@ -175,9 +278,9 @@ self.onDataUpdated = function () {
     return keyMap[metric] || [metric];
   }
 
-  const TEMP_KEYS  = ['Temperature_C', 'Temperature', 'Temp_C'];
-  const RUN_KEYS   = ['Motor_Run_Flag', 'Motor_Run', 'Run_Flag'];
-  const MAG_KEYS   = ['Magnitude_XYZ_HighFreq_RMSAcc_G'];
+  const TEMP_KEYS = ['Temperature_C', 'Temperature', 'Temp_C'];
+  const RUN_KEYS  = ['Motor_Run_Flag', 'Motor_Run', 'Run_Flag'];
+  const MAG_KEYS  = ['Magnitude_XYZ_HighFreq_RMSAcc_G'];
 
   const HARM_LABELS = ['1X', '2X', '3X', '4X', '5X', '6X'];
   const H_FREQ = {
@@ -186,7 +289,6 @@ self.onDataUpdated = function () {
     z: [25, 50, 75, 100, 125, 150, 175, 200, 225, 250]
   };
 
-  // type: 'acl' | 'vel'
   function getHarmVal(axis, type, idx) {
     const n = idx + 1;
     const A = axis.toUpperCase();
@@ -219,7 +321,6 @@ self.onDataUpdated = function () {
     };
   }
 
-  // 5-min data → show HH:MM, not seconds
   const TIME_X = { tickformat: '%H:%M', hoverformat: '%d %b %H:%M' };
 
   function noDataLayout(extra = {}) {
@@ -532,7 +633,6 @@ self.onDataUpdated = function () {
 
     drawRing(computeHealth());
     renderSpark();
-    // "Last sync" is handled by the 1s status timer using the telemetry timestamp
   }
 
   // ─────────────────────────────────────
@@ -821,7 +921,7 @@ self.onDataUpdated = function () {
   }
 
   // ─────────────────────────────────────
-  // 13. RUL (updates once per NEW 5-min sample, based on real elapsed time)
+  // 13. RUL (placeholder, reduced by real elapsed time between samples)
   // ─────────────────────────────────────
   function updateRUL() {
     const xv = latestVal(getKeyName('x', 'rms_vel'));
@@ -847,7 +947,7 @@ self.onDataUpdated = function () {
   }
 
   // ─────────────────────────────────────
-  // 14. RENDER (only when a new sample arrived)
+  // 14. RENDER
   // ─────────────────────────────────────
   updateRUL();
   updateKPIs();
@@ -858,7 +958,6 @@ self.onDataUpdated = function () {
   renderFaults();
   renderEvents();
 
-  // Tell you which expected keys were not found (printed once per change)
   if (missingKeys.size) {
     const sig = [...missingKeys].join(',');
     if (self.ctx._missingSig !== sig) {
