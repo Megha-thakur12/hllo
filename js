@@ -5,16 +5,14 @@
 
 self.onInit = function () {
 
-  const DATA_INTERVAL_MS = 5 * 60 * 1000;          // telemetry arrives every 5 min
-  const STALE_AFTER_MS   = 2 * DATA_INTERVAL_MS + 60 * 1000; // ~11 min => stale
+  const DATA_INTERVAL_MS = 5 * 60 * 1000;                     // telemetry every 5 min
+  const STALE_AFTER_MS   = 2 * DATA_INTERVAL_MS + 60 * 1000;  // ~11 min => stale
 
-  if (!self.ctx._rulState) {
-    self.ctx._rulState = { pRul: null };
-  }
+  if (!self.ctx._rulState) self.ctx._rulState = { pRul: null };
 
   function pad(n) { return n < 10 ? '0' + n : '' + n; }
 
-  // Updates clock + "last sync" + countdown. Runs every 1s, independent of data.
+  // Clock + last-data + countdown. Runs every 1s, independent of data.
   self.ctx._updateStatus = function () {
     const now = Date.now();
 
@@ -22,13 +20,13 @@ self.onInit = function () {
     if (clk) clk.textContent = new Date(now).toLocaleTimeString();
 
     const last = self.ctx._lastDataTs || null;
-
     const lastSync = document.getElementById('lastSync');
     const pCD = document.getElementById('pCD');
 
     if (!last) {
-      if (lastSync) { lastSync.textContent = 'Waiting for data…'; lastSync.style.color = '#94a3b8'; }
-      if (pCD) pCD.textContent = 'Waiting for data…';
+      const msg = self.ctx._gotKeys ? 'No telemetry in selected timewindow' : 'Waiting for data…';
+      if (lastSync) { lastSync.textContent = msg; lastSync.style.color = '#94a3b8'; }
+      if (pCD) pCD.textContent = msg;
       return;
     }
 
@@ -67,12 +65,13 @@ self.onDestroy = function () {
 
 self.onDataUpdated = function () {
 
-  const DATA_INTERVAL_MS = 5 * 60 * 1000;
-
   const data = self.ctx.data;
   if (!data || !data.length) return;
+  self.ctx._gotKeys = true;
 
-  // Clean data: drop null / empty / NaN values
+  // ─────────────────────────────────────
+  // 0. CLEAN DATA + DIAGNOSTICS
+  // ─────────────────────────────────────
   const result = data.map(item => {
     const rows = item.data
       ? item.data
@@ -82,46 +81,72 @@ self.onDataUpdated = function () {
     return { name: item.dataKey.name || item.dataKey.label, data: rows };
   });
 
+  // Normalised lookup: ignore case, underscores, spaces, dashes
+  const norm = s => String(s).toLowerCase().replace(/[^a-z0-9]/g, '');
+  const keyIndex = {};
+  result.forEach(r => { keyIndex[norm(r.name)] = r; });
+
+  // Log keys once, and again whenever the set of keys changes
+  const keySig = result.map(r => r.name + ':' + r.data.length).join('|');
+  if (self.ctx._keySig !== keySig) {
+    self.ctx._keySig = keySig;
+    console.log('[Vibration widget] keys received:',
+      result.map(r => `${r.name} → ${r.data.length} pts`));
+  }
+
   // ─────────────────────────────────────
-  // 0. NEW-DATA DETECTION (5-min cadence)
+  // 0b. NEW-DATA DETECTION (5-min cadence)
   // ─────────────────────────────────────
   let newestTs = 0;
   result.forEach(r => {
-    if (r.data.length) {
-      const t = r.data.reduce((m, d) => Math.max(m, d[0]), 0);
-      if (t > newestTs) newestTs = t;
-    }
+    r.data.forEach(d => { if (d[0] > newestTs) newestTs = d[0]; });
   });
 
   const prevTs = self.ctx._lastDataTs || null;
   const chartExists = !!document.querySelector('#waveChart .js-plotly-plot, #waveChart.js-plotly-plot');
 
-  // Same sample as last render and charts already drawn → nothing to redraw
-  if (newestTs && prevTs === newestTs && chartExists) {
-    if (self.ctx._updateStatus) self.ctx._updateStatus();
-    return;
+  if (newestTs) {
+    // Same sample as last render and charts already drawn → nothing to redraw
+    if (prevTs === newestTs && chartExists) {
+      if (self.ctx._updateStatus) self.ctx._updateStatus();
+      return;
+    }
+    self.ctx._lastDataTs = newestTs;
+  } else {
+    // No points at all: render the empty state once, then stay quiet
+    if (self.ctx._emptyRendered && chartExists) {
+      if (self.ctx._updateStatus) self.ctx._updateStatus();
+      return;
+    }
+    self.ctx._emptyRendered = true;
+    console.warn('[Vibration widget] keys arrived but contain 0 points. ' +
+      'Check the timewindow (use Realtime – last 24 hours) and that the device is sending telemetry.');
   }
-
-  if (newestTs) self.ctx._lastDataTs = newestTs;
 
   // ─────────────────────────────────────
   // 1. HELPERS & TELEMETRY KEY MAP
   // ─────────────────────────────────────
-  function getSeries(name) {
-    const entry = result.find(r => r.name === name);
-    if (!entry || !entry.data || entry.data.length === 0) return null;
-    return entry.data;
+  const missingKeys = new Set();
+
+  // Find a series by one name or a list of candidate names
+  function getSeries(names) {
+    const list = Array.isArray(names) ? names : [names];
+    for (const n of list) {
+      const entry = keyIndex[norm(n)];
+      if (entry && entry.data.length) return entry.data;
+    }
+    missingKeys.add(list[0]);
+    return null;
   }
 
-  // Sort ascending by timestamp and split into xs / ys
   function parseXY(series) {
     if (!series || series.length === 0) return { xs: [], ys: [] };
     const sorted = [...series].sort((a, b) => a[0] - b[0]);
     return { xs: sorted.map(d => new Date(d[0])), ys: sorted.map(d => Number(d[1])) };
   }
 
-  function latestVal(name) {
-    const s = getSeries(name);
+  function latestVal(names) {
+    const s = getSeries(names);
     if (!s) return null;
     const { ys } = parseXY(s);
     if (!ys.length) return null;
@@ -129,23 +154,30 @@ self.onDataUpdated = function () {
     return (val !== null && val !== undefined && !isNaN(val)) ? Number(val) : null;
   }
 
-  function latestBool(name) {
-    const v = latestVal(name);
+  function latestBool(names) {
+    const v = latestVal(names);
     return v !== null ? v > 0 : null;
   }
 
+  // Returns a list of candidate key names (first = canonical)
   function getKeyName(axis, metric) {
-    const axisFormatted = axis.toUpperCase() === 'X' ? 'Xaxis' : axis.toUpperCase() === 'Y' ? 'Yaxis' : 'Zaxis';
+    const A = axis.toUpperCase();
+    const a = axis.toLowerCase();
+    const P = `${A}axis`;
     const keyMap = {
-      'rms_vel': `${axisFormatted}_RMSVel_mm_sec`,
-      'peak_acl': `${axisFormatted}_HighFreq_PeakAcc_G`,
-      'rms_acl': `${axisFormatted}_HighFreq_RMSAcc_G`,
-      'full_rms_acl': `${axisFormatted}_FullBand_RMSAcc_G`,
-      'peak_freq': `${axisFormatted}_PeakAcc_Freq_Hz`,
-      'vel_freq': `${axisFormatted}_PeakVel_ComponentFreq_Hz`
+      'rms_vel':      [`${P}_RMSVel_mm_sec`, `Vibit_${a}_rms_vel`, `${P}_RMSVel`],
+      'peak_acl':     [`${P}_HighFreq_PeakAcc_G`, `Vibit_${a}_peak_acl`],
+      'rms_acl':      [`${P}_HighFreq_RMSAcc_G`, `Vibit_${a}_rms_acl`],
+      'full_rms_acl': [`${P}_FullBand_RMSAcc_G`],
+      'peak_freq':    [`${P}_PeakAcc_Freq_Hz`],
+      'vel_freq':     [`${P}_PeakVel_ComponentFreq_Hz`]
     };
-    return keyMap[metric] || metric;
+    return keyMap[metric] || [metric];
   }
+
+  const TEMP_KEYS  = ['Temperature_C', 'Temperature', 'Temp_C'];
+  const RUN_KEYS   = ['Motor_Run_Flag', 'Motor_Run', 'Run_Flag'];
+  const MAG_KEYS   = ['Magnitude_XYZ_HighFreq_RMSAcc_G'];
 
   const HARM_LABELS = ['1X', '2X', '3X', '4X', '5X', '6X'];
   const H_FREQ = {
@@ -154,9 +186,16 @@ self.onDataUpdated = function () {
     z: [25, 50, 75, 100, 125, 150, 175, 200, 225, 250]
   };
 
+  // type: 'acl' | 'vel'
   function getHarmVal(axis, type, idx) {
     const n = idx + 1;
-    return latestVal(`${axis.toUpperCase()}axis_${type}_amp_${n}x`);
+    const A = axis.toUpperCase();
+    const a = axis.toLowerCase();
+    return latestVal([
+      `${A}axis_${type}_amp_${n}x`,
+      `Vibit_${a}_rms_${type}_amp_${n}x`,
+      `Vibit_${a}_${type}_amp_${n}x`
+    ]);
   }
 
   // ─────────────────────────────────────
@@ -180,7 +219,7 @@ self.onDataUpdated = function () {
     };
   }
 
-  // Time-axis layout: 5-min data → show HH:MM, not seconds
+  // 5-min data → show HH:MM, not seconds
   const TIME_X = { tickformat: '%H:%M', hoverformat: '%d %b %H:%M' };
 
   function noDataLayout(extra = {}) {
@@ -251,8 +290,11 @@ self.onDataUpdated = function () {
     const amps = HARM_LABELS.map((_, i) => getHarmVal(ax, 'acl', i));
     if (amps.every(v => v === null)) return null;
     const freqs = Array.from({ length: 10 }, (_, i) => {
-      const nm = `${ax.toUpperCase()}axis_rms_acl_freq_${i + 1}x`;
-      return latestVal(nm) ?? H_FREQ[ax][i];
+      const n = i + 1;
+      return latestVal([
+        `${ax.toUpperCase()}axis_rms_acl_freq_${n}x`,
+        `Vibit_${ax}_rms_acl_freq_${n}x`
+      ]) ?? H_FREQ[ax][i];
     });
     const c = WAVE_COLORS[ax];
     const safeAmps = amps.map(v => v ?? 0);
@@ -429,9 +471,9 @@ self.onDataUpdated = function () {
     const yp = latestVal(getKeyName('y', 'peak_acl'));
     const zp = latestVal(getKeyName('z', 'peak_acl'));
 
-    const tmp = latestVal('Temperature_C');
-    const running = latestBool('Motor_Run_Flag');
-    const magHighFreqAcc = latestVal('Magnitude_XYZ_HighFreq_RMSAcc_G');
+    const tmp = latestVal(TEMP_KEYS);
+    const running = latestBool(RUN_KEYS);
+    const magHighFreqAcc = latestVal(MAG_KEYS);
 
     setEl('k-xv', xv !== null ? xv.toFixed(2) : ND);
     setEl('k-xvd', xv !== null ? (xv > 4.5 ? 'WARN (>4.5)' : 'NORMAL') : 'NO DATA');
@@ -500,7 +542,7 @@ self.onDataUpdated = function () {
     const sp = document.getElementById('sparkR');
     if (!sp) return;
     sp.innerHTML = '';
-    const raw = getSeries('Temperature_C');
+    const raw = getSeries(TEMP_KEYS);
     if (!raw) {
       sp.innerHTML = `<span style="color:#94a3b8;font-size:10px;align-self:center">No Data</span>`;
       return;
@@ -521,7 +563,7 @@ self.onDataUpdated = function () {
   }
 
   // ─────────────────────────────────────
-  // 10. FAULT PREDICTION & RUL
+  // 10. FAULT PREDICTION
   // ─────────────────────────────────────
   if (!self.ctx._rulState) self.ctx._rulState = { pRul: null };
   const state = self.ctx._rulState;
@@ -793,21 +835,19 @@ self.onDataUpdated = function () {
       return;
     }
 
-    if (state.pRul === null) state.pRul = 847;   // starting RUL in hours (placeholder)
+    if (state.pRul === null) state.pRul = 847;   // placeholder starting RUL (hours)
 
-    // Reduce RUL by real hours elapsed between telemetry samples
     if (prevTs && newestTs > prevTs) {
       const elapsedHours = (newestTs - prevTs) / 3600000;
       state.pRul = Math.max(50, state.pRul - elapsedHours);
     }
 
-    const rul = Math.round(state.pRul);
-    setEl('rulV', rul);
+    setEl('rulV', Math.round(state.pRul));
     setEl('rulSub', `≈ ${(state.pRul / 24).toFixed(1)} days · Confidence: HIGH`);
   }
 
   // ─────────────────────────────────────
-  // 14. RENDER (only runs when a new sample arrived)
+  // 14. RENDER (only when a new sample arrived)
   // ─────────────────────────────────────
   updateRUL();
   updateKPIs();
@@ -817,6 +857,15 @@ self.onDataUpdated = function () {
   refreshHarmCharts();
   renderFaults();
   renderEvents();
+
+  // Tell you which expected keys were not found (printed once per change)
+  if (missingKeys.size) {
+    const sig = [...missingKeys].join(',');
+    if (self.ctx._missingSig !== sig) {
+      self.ctx._missingSig = sig;
+      console.warn('[Vibration widget] expected keys not found / empty:', [...missingKeys]);
+    }
+  }
 
   if (self.ctx._updateStatus) self.ctx._updateStatus();
 };
