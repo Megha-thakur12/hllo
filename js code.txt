@@ -1,0 +1,682 @@
+self.onInit = function () {};
+
+self.onDataUpdated = function () {
+  setTimeout(function () {
+    var data = self.ctx.data;
+    let result = data.map(item => ({
+      name: item.dataKey.name,
+      data: item.data.map(entry => [entry[0], entry[1]])
+    }));
+
+    // ─────────────────────────────────────
+    // 1. CONFIG – new data keys
+    // ─────────────────────────────────────
+    const AXES = ['x', 'y', 'z'];
+    const AX_NAME = { x: 'X', y: 'Y', z: 'Z' };
+    const AX_COLOR = { x: '#0ea5e9', y: '#6366f1', z: '#10b981' };
+    const AXIAL_AXIS = 'z';            // axis assumed to be along the shaft (used for misalignment)
+    const STALE_MS = 10 * 60 * 1000;   // data older than this = "NO DATA / STALE"
+    const VEL_ALERT = 7.1;             // mm/s RMS (ISO 10816 alert level used for scoring)
+    const ND = '—';
+
+    // Signal -> key suffix (first one found is used). Full key = <X|Y|Z>axis_<suffix>
+    const SIGNALS = {
+      velMm:       ['RMSVel_mm_sec'],
+      velIn:       ['RMSVel_in_sec'],
+      fbRms:       ['FullBand_RMSAcc_G'],
+      fbPkPk:      ['FullBand_PkPk_Acc_G'],
+      fbCrest:     ['FullBand_CrestFactor'],
+      fbKurt:      ['FullBand_Kurtosis'],
+      hfRms:       ['HighFreq_RMSAcc_G', 'HighFreq_RMSAcc2_G'],
+      hfPeak:      ['HighFreq_PeakAcc_G'],
+      hfCrest:     ['HighFreq_CrestFactor'],
+      hfKurt:      ['HighFreq_Kurtosis'],
+      peakAccFreq: ['PeakAcc_Freq_Hz'],
+      peakVelFreq: ['PeakVel_ComponentFreq_Hz']
+    };
+
+    // ─────────────────────────────────────
+    // 2. HELPERS
+    // ─────────────────────────────────────
+    function getSeries(name) {
+      const entry = result.find(r => r.name === name);
+      if (!entry || !entry.data || entry.data.length === 0) return null;
+      return entry.data;
+    }
+
+    function parseXY(series) {
+      if (!series || !series.length) return { xs: [], ys: [] };
+      const xs = [], ys = [];
+      series.forEach(d => {
+        const y = Number(d[1]);
+        if (d[1] === null || d[1] === undefined || !isFinite(y)) return;
+        xs.push(new Date(d[0])); ys.push(y);
+      });
+      return { xs, ys };
+    }
+
+    function latestVal(name) {
+      const s = getSeries(name);
+      if (!s) return null;
+      const { ys } = parseXY(s);
+      return ys.length ? ys[ys.length - 1] : null;
+    }
+
+    function latestBool(name) {
+      const v = latestVal(name);
+      return v !== null ? v > 0 : null;
+    }
+
+    function axisSeries(ax, sig) {
+      for (const suf of SIGNALS[sig]) {
+        const s = getSeries(`${AX_NAME[ax]}axis_${suf}`);
+        if (s) return s;
+      }
+      return null;
+    }
+
+    function val(ax, sig) {
+      const s = axisSeries(ax, sig);
+      if (!s) return null;
+      const { ys } = parseXY(s);
+      return ys.length ? ys[ys.length - 1] : null;
+    }
+
+    function latestTs() {
+      let t = null;
+      result.forEach(r => {
+        if (!r.data.length) return;
+        const ts = Number(r.data[r.data.length - 1][0]);
+        if (isFinite(ts) && (t === null || ts > t)) t = ts;
+      });
+      return t;
+    }
+
+    function clamp(v, min = 0, max = 1) { return Math.max(min, Math.min(max, v)); }
+    function safeDiv(a, b) {
+      if (a === null || b === null || b === 0) return null;
+      const v = a / b;
+      return isFinite(v) ? v : null;
+    }
+    function norm(v, lo, hi) { return v === null ? null : clamp((v - lo) / (hi - lo)); }
+    function avg(arr) {
+      const v = arr.filter(x => x !== null && x !== undefined);
+      return v.length ? v.reduce((a, b) => a + b, 0) / v.length : null;
+    }
+    function max(arr) {
+      const v = arr.filter(x => x !== null && x !== undefined);
+      return v.length ? Math.max(...v) : null;
+    }
+    function fmt(v, d = 2) { return v !== null && v !== undefined ? v.toFixed(d) : ND; }
+
+    function isoZone(v) {
+      if (v === null) return 'NO DATA';
+      if (v < 2.3) return 'NORMAL';
+      if (v < 4.5) return 'SATISFACTORY';
+      if (v < 7.1) return 'ALERT';
+      return 'DANGER';
+    }
+
+    function setEl(id, v) { const e = document.getElementById(id); if (e) e.textContent = v; }
+    function setStyle(id, p, v) { const e = document.getElementById(id); if (e) e.style[p] = v; }
+
+    // ─────────────────────────────────────
+    // 3. PLOTLY CONFIG
+    // ─────────────────────────────────────
+    const PLY_CFG = { responsive: true, displayModeBar: false };
+    const PLY_FONT = { family: 'DM Sans, sans-serif', size: 10, color: '#64748b' };
+
+    function baseLayout(extra = {}) {
+      return {
+        paper_bgcolor: 'rgba(0,0,0,0)',
+        plot_bgcolor: 'rgba(0,0,0,0)',
+        font: PLY_FONT,
+        margin: { t: 4, b: 28, l: 40, r: 8 },
+        showlegend: false,
+        xaxis: { gridcolor: '#e2e8f0', tickfont: { size: 9 }, linecolor: '#e2e8f0', zeroline: false },
+        yaxis: { gridcolor: '#e2e8f0', tickfont: { size: 9 }, linecolor: '#e2e8f0', zeroline: false },
+        ...extra
+      };
+    }
+
+    function noDataLayout(extra = {}) {
+      return {
+        ...baseLayout(extra),
+        annotations: [{
+          text: 'No Data Available', xref: 'paper', yref: 'paper', x: 0.5, y: 0.5,
+          showarrow: false, font: { size: 14, color: '#94a3b8', family: 'DM Sans, sans-serif' }
+        }],
+        xaxis: { ...baseLayout().xaxis, visible: false },
+        yaxis: { ...baseLayout().yaxis, visible: false }
+      };
+    }
+
+    // One function for first draw + refresh (Plotly.react creates the plot if it doesn't exist)
+    function plot(id, traces, layout) {
+      if (!document.getElementById(id)) return;
+      if (!traces || !traces.length) Plotly.react(id, [], noDataLayout(layout), PLY_CFG);
+      else Plotly.react(id, traces, baseLayout(layout), PLY_CFG);
+    }
+
+    const yTitle = t => ({ yaxis: { ...baseLayout().yaxis, title: { text: t, font: { size: 9 } } } });
+
+    // ─────────────────────────────────────
+    // 4. WAVEFORM (RMS velocity mm/s, selected axis)
+    // ─────────────────────────────────────
+    let wAxis = self.ctx._wAxis || 'x';
+
+    function buildWaveData(ax) {
+      const raw = axisSeries(ax, 'velMm');
+      if (!raw) return null;
+      const { xs, ys } = parseXY(raw);
+      if (!xs.length) return null;
+      const c = AX_COLOR[ax];
+      return [{
+        x: xs.slice(-60), y: ys.slice(-60), type: 'scatter', mode: 'lines',
+        line: { color: c, width: 2, shape: 'spline' },
+        fill: 'tozeroy', fillcolor: c + '18',
+        hovertemplate: '%{y:.3f} mm/s<extra></extra>'
+      }];
+    }
+    function refreshWave() { plot('waveChart', buildWaveData(wAxis), yTitle('mm/s')); }
+
+    window.setWAxis = function (ax, btn) {
+      wAxis = ax; self.ctx._wAxis = ax;
+      document.querySelectorAll('#wtabs .atab').forEach(b => b.className = 'atab');
+      btn.className = `atab a${ax}`;
+      refreshWave();
+    };
+
+    // ─────────────────────────────────────
+    // 5. ACCELERATION METRICS (replaces harmonic spectrum)
+    // ─────────────────────────────────────
+    let sAxis = self.ctx._sAxis || 'x';
+
+    function buildAccData(ax) {
+      const labels = ['FullBand RMS', 'HighFreq RMS', 'HighFreq Peak', 'FullBand Pk-Pk'];
+      const vals = [val(ax, 'fbRms'), val(ax, 'hfRms'), val(ax, 'hfPeak'), val(ax, 'fbPkPk')];
+      if (vals.every(v => v === null)) return null;
+      const c = AX_COLOR[ax];
+      const pf = val(ax, 'peakAccFreq');
+      return [{
+        x: labels, y: vals.map(v => v ?? 0), type: 'bar',
+        marker: { color: [c, c, c, c], opacity: 0.85, line: { color: c, width: 1 } },
+        customdata: labels.map(() => pf !== null ? pf.toFixed(1) : ND),
+        hovertemplate: '<b>%{x}</b><br>%{y:.3f} G<br>Peak acc. freq: %{customdata} Hz<extra></extra>'
+      }];
+    }
+    function refreshSpec() { plot('specChart', buildAccData(sAxis), yTitle('G')); }
+
+    window.setSAxis = function (ax, btn) {
+      sAxis = ax; self.ctx._sAxis = ax;
+      document.querySelectorAll('#stabs .atab').forEach(b => b.className = 'atab');
+      btn.className = `atab a${ax}`;
+      refreshSpec();
+    };
+
+    // ─────────────────────────────────────
+    // 6. TREND (RMS velocity, all axes)
+    // ─────────────────────────────────────
+    function buildTrendData() {
+      const traces = [];
+      AXES.forEach(ax => {
+        const raw = axisSeries(ax, 'velMm');
+        if (!raw) return;
+        const { xs, ys } = parseXY(raw);
+        if (!xs.length) return;
+        const n = AX_NAME[ax] + '-Axis';
+        traces.push({
+          x: xs, y: ys, name: n, type: 'scatter', mode: 'lines',
+          line: { color: AX_COLOR[ax], width: 2, shape: 'spline' },
+          fill: 'tozeroy', fillcolor: AX_COLOR[ax] + '10',
+          hovertemplate: `<b>${n}</b>: %{y:.3f} mm/s<extra></extra>`
+        });
+      });
+      return traces;
+    }
+    const trendLayout = {
+      showlegend: true,
+      legend: { orientation: 'h', x: 0, y: 1.12, font: { size: 10 } },
+      margin: { t: 8, b: 32, l: 44, r: 8 },
+      yaxis: { ...baseLayout().yaxis, title: { text: 'mm/s RMS', font: { size: 9 } } },
+      hovermode: 'x unified'
+    };
+    function refreshTrend() { plot('trendChart', buildTrendData(), trendLayout); }
+
+    // ─────────────────────────────────────
+    // 7. CONDITION INDICATORS (Crest factor / Kurtosis, FullBand vs HighFreq)
+    //    Re-uses the old harmAclChart / harmVelChart containers
+    // ─────────────────────────────────────
+    function buildCondData(kind) {
+      const sigs = kind === 'crest' ? ['fbCrest', 'hfCrest'] : ['fbKurt', 'hfKurt'];
+      const traces = [];
+      AXES.forEach(ax => {
+        const v = sigs.map(s => val(ax, s));
+        if (v.every(x => x === null)) return;
+        traces.push({
+          x: ['Full Band', 'High Freq'], y: v.map(x => x ?? 0),
+          name: AX_NAME[ax], type: 'bar',
+          marker: { color: AX_COLOR[ax], opacity: 0.8, line: { color: AX_COLOR[ax], width: 1 } },
+          hovertemplate: `<b>${AX_NAME[ax]} %{x}</b>: %{y:.2f}<extra></extra>`
+        });
+      });
+      return traces;
+    }
+    function condLayout(title, baseline) {
+      const l = {
+        barmode: 'group', showlegend: true,
+        legend: { orientation: 'h', x: 0, y: 1.12, font: { size: 10 } },
+        margin: { t: 8, b: 28, l: 40, r: 8 },
+        yaxis: { ...baseLayout().yaxis, title: { text: title, font: { size: 9 } } }
+      };
+      if (baseline) l.shapes = [{ type: 'line', xref: 'paper', x0: 0, x1: 1, y0: baseline, y1: baseline,
+        line: { color: '#94a3b8', width: 1, dash: 'dot' } }];
+      return l;
+    }
+    function refreshCond() {
+      plot('harmAclChart', buildCondData('crest'), condLayout('Crest Factor'));
+      plot('harmVelChart', buildCondData('kurt'), condLayout('Kurtosis', 3)); // 3 = normal baseline
+    }
+
+    // ─────────────────────────────────────
+    // 8. HEALTH RING
+    // ─────────────────────────────────────
+    const rC = document.getElementById('ringC');
+    const rX = rC ? rC.getContext('2d') : null;
+
+    function computeHealth() {
+      const worst = max(AXES.map(a => val(a, 'velMm')));
+      if (worst === null) return null;
+      if (worst < 2.3) return 95;
+      if (worst < 4.5) return 82;
+      if (worst < 7.1) return 65;
+      if (worst < 11.2) return 40;
+      return 18;
+    }
+
+    function drawRing(s) {
+      if (!rX) return;
+      rX.clearRect(0, 0, 130, 130);
+      const cx = 65, cy = 65, r = 52;
+      const hScore = document.getElementById('hScore');
+      if (s === null) {
+        rX.beginPath(); rX.arc(cx, cy, r, -Math.PI / 2, Math.PI * 1.5);
+        rX.strokeStyle = '#e2e8f0'; rX.lineWidth = 10; rX.stroke();
+        if (hScore) { hScore.textContent = 'N/A'; hScore.style.color = '#94a3b8'; }
+        return;
+      }
+      const c = s > 80 ? '#10b981' : s > 50 ? '#f59e0b' : '#ef4444';
+      rX.beginPath(); rX.arc(cx, cy, r, -Math.PI / 2, Math.PI * 1.5);
+      rX.strokeStyle = s > 80 ? '#d1fae5' : s > 50 ? '#fef9c3' : '#fee2e2';
+      rX.lineWidth = 10; rX.stroke();
+      rX.beginPath(); rX.arc(cx, cy, r, -Math.PI / 2, -Math.PI / 2 + (s / 100) * Math.PI * 2);
+      rX.strokeStyle = c; rX.lineWidth = 10; rX.lineCap = 'round'; rX.stroke();
+      if (hScore) { hScore.textContent = s; hScore.style.color = c; }
+    }
+
+    // ─────────────────────────────────────
+    // 9. KPI + STATUS UPDATE
+    // ─────────────────────────────────────
+    function setBadge(id, state, okTxt, badTxt) {
+      const el = document.getElementById(id);
+      if (!el) return;
+      if (state === null) { el.textContent = 'NO DATA'; el.className = 'badge b-nd'; }
+      else { el.textContent = state ? okTxt : badTxt; el.className = 'badge ' + (state ? 'b-ok' : 'b-live'); }
+    }
+
+    function updateKPIs() {
+      const xv = val('x', 'velMm'), yv = val('y', 'velMm'), zv = val('z', 'velMm');
+      const pk = AXES.map(a => val(a, 'hfPeak'));
+      const tmp = latestVal('Temperature_C');
+      const tmpF = latestVal('Temperature_F');
+      const mag = latestVal('Magnitude_XYZ_HighFreq_RMSAcc_G');
+      const running = latestBool('Motor_Run_Flag');
+      const ts = latestTs();
+
+      // RMS velocity KPIs
+      setEl('k-xv', fmt(xv)); setEl('k-yv', fmt(yv)); setEl('k-zv', fmt(zv));
+      setEl('k-xvd', isoZone(xv)); setEl('k-yvd', isoZone(yv)); setEl('k-zvd', isoZone(zv));
+
+      // Peak acceleration (HighFreq peak, G)
+      const pkMax = max(pk);
+      setEl('k-pk', fmt(pkMax));
+      setEl('k-pkd', `X:${fmt(pk[0], 1)} Y:${fmt(pk[1], 1)} Z:${fmt(pk[2], 1)}`);
+
+      // Temperature
+      setEl('k-tmp', fmt(tmp, 1));
+      setEl('tmpV', fmt(tmp, 1));
+
+      // Machine status (Motor_Run_Flag)
+      if (running !== null) {
+        setEl('k-ms', running ? 'RUNNING' : 'STOPPED');
+        setStyle('k-ms', 'color', running ? '#059669' : '#ef4444');
+        setEl('machineLabel', running ? 'MOTOR RUNNING' : 'MOTOR STOPPED');
+      } else {
+        setEl('k-ms', 'NO DATA');
+        setStyle('k-ms', 'color', '#94a3b8');
+        setEl('machineLabel', 'NO DATA');
+      }
+
+      // XYZ HF magnitude (replaces noise)
+      setEl('k-noise', `HF Mag: ${fmt(mag)} G`);
+      setEl('k-reboot', `● Temp: ${fmt(tmpF, 1)} °F`);
+      if (mag !== null) {
+        setEl('noiseV', fmt(mag) + ' G');
+        const pin = document.getElementById('noisePin');
+        if (pin) pin.style.left = Math.min(100, (mag / 2) * 100) + '%';   // scale: 0–2 G
+        setStyle('noiseV', 'color', mag > 1.5 ? '#ef4444' : mag > 0.8 ? '#f59e0b' : '#059669');
+      } else {
+        setEl('noiseV', ND);
+        setStyle('noiseV', 'color', '#94a3b8');
+      }
+
+      // Status rows (re-used badges)
+      setBadge('mqttBadge', ts === null ? null : (Date.now() - ts) < STALE_MS, 'LIVE', 'STALE');
+      setBadge('netBadge', running, 'RUNNING', 'STOPPED');
+      setBadge('ledBadge', tmp === null ? null : tmp < 85, 'OK', tmp >= 100 ? 'CRITICAL' : 'WARN');
+      setEl('rebootBadge', tmpF !== null ? tmpF.toFixed(1) + ' °F' : ND);
+
+      // Axis gauges
+      setEl('gX', fmt(xv)); setEl('gY', fmt(yv)); setEl('gZ', fmt(zv));
+      [['gXf', xv], ['gYf', yv], ['gZf', zv]].forEach(([id, v]) => {
+        const e = document.getElementById(id);
+        if (e) e.style.width = v !== null ? Math.min(100, v * 8.9) + '%' : '0%';
+      });
+
+      drawRing(computeHealth());
+      renderSpark();
+
+      const lastSync = document.getElementById('lastSync');
+      if (lastSync) lastSync.textContent = 'Last sync: ' + new Date().toLocaleTimeString();
+    }
+
+    // ─────────────────────────────────────
+    // 10. SPARKLINE (Temperature_C)
+    // ─────────────────────────────────────
+    function renderSpark() {
+      const sp = document.getElementById('sparkR');
+      if (!sp) return;
+      sp.innerHTML = '';
+      const raw = getSeries('Temperature_C');
+      const vals = raw ? parseXY(raw).ys.slice(-24) : [];
+      if (!vals.length) {
+        sp.innerHTML = `<span style="color:#94a3b8;font-size:10px;align-self:center">No Data</span>`;
+        return;
+      }
+      const mx = Math.max(...vals, 1);
+      vals.forEach(v => {
+        const b = document.createElement('div'); b.className = 'spark-b';
+        const t = v / 85;
+        b.style.cssText = `height:${(v / mx) * 100}%;background:${t > 0.85 ? '#ef4444' : t > 0.7 ? '#f59e0b' : '#10b981'};opacity:0.8;`;
+        sp.appendChild(b);
+      });
+    }
+
+    // ─────────────────────────────────────
+    // 11. FAULT PREDICTION (rule-based indicators from the new keys)
+    // ─────────────────────────────────────
+    if (!self.ctx._rulState) self.ctx._rulState = { pRul: null, pCd: 5 };
+    const state = self.ctx._rulState;
+
+    const FAULTS = [
+      { name: 'Unbalance', sub: 'High velocity, low-frequency dominant', color: '#f59e0b', border: '#fde68a', prob: null,
+        algorithm: 'Velocity & Spectral Dominance',
+        formula: 'P = 0.6·(Vel/Limit) + 0.4·(1 − HF/FullBand)',
+        formula_vars: 'Vel = RMSVel_mm_sec · HF/FB = HighFreq / FullBand RMS acc',
+        features: [{ label: 'Velocity / ISO limit', val: null, color: '#f59e0b' },
+                   { label: 'Low-freq dominance', val: null, color: '#f59e0b' }],
+        action: 'Perform rotor balancing' },
+      { name: 'Misalignment', sub: 'Axial vibration vs radial', color: '#ef4444', border: '#fecaca', prob: null,
+        algorithm: 'Axial / Radial Velocity Ratio',
+        formula: `P = 0.6·(${AXIAL_AXIS.toUpperCase()} / avg(radial)) + 0.4·(Vel/Limit)`,
+        formula_vars: 'Higher axial-to-radial ratio → misalignment',
+        features: [{ label: 'Axial / Radial ratio', val: null, color: '#ef4444' },
+                   { label: 'Velocity / ISO limit', val: null, color: '#ef4444' }],
+        action: 'Inspect shaft alignment & coupling' },
+      { name: 'Bearing Defect', sub: 'High-frequency impacting', color: '#6366f1', border: '#c7d2fe', prob: null,
+        algorithm: 'High-Frequency Impact Analysis',
+        formula: 'P = 0.4·Kurt(HF) + 0.35·Crest(HF) + 0.25·(HF/FullBand)',
+        formula_vars: 'Kurtosis > 3 and high crest factor → impacts',
+        features: [{ label: 'HF Kurtosis', val: null, color: '#6366f1' },
+                   { label: 'HF Crest factor', val: null, color: '#6366f1' },
+                   { label: 'HF / FullBand RMS', val: null, color: '#6366f1' }],
+        action: 'Inspect bearings for wear or damage' },
+      { name: 'Looseness', sub: 'Broadband impacts + vibration', color: '#0ea5e9', border: '#bae6fd', prob: null,
+        algorithm: 'Full-Band Distortion Analysis',
+        formula: 'P = 0.35·Kurt(FB) + 0.30·Crest(FB) + 0.35·(Vel/Limit)',
+        formula_vars: 'Full-band kurtosis/crest + elevated velocity',
+        features: [{ label: 'FullBand Kurtosis', val: null, color: '#0ea5e9' },
+                   { label: 'FullBand Crest factor', val: null, color: '#0ea5e9' },
+                   { label: 'Velocity / ISO limit', val: null, color: '#0ea5e9' }],
+        action: 'Check mounting, bolts, and base' },
+      { name: 'Resonance', sub: 'Acc. & velocity peaks at same frequency', color: '#10b981', border: '#a7f3d0', prob: null,
+        algorithm: 'Peak Frequency Coincidence',
+        formula: 'P = 0.4·Agreement(PeakAcc_Hz, PeakVel_Hz) + 0.6·(Vel/Limit)',
+        formula_vars: 'Same dominant frequency in acc & vel + high amplitude',
+        features: [{ label: 'Peak freq agreement', val: null, color: '#10b981' },
+                   { label: 'Velocity / ISO limit', val: null, color: '#10b981' }],
+        action: 'Check structural resonance / speed match' }
+    ];
+    const FAULT_CAP = [0.98, 0.95, 0.95, 0.9, 0.9];
+
+    const hfRatio = ax => {
+      const r = safeDiv(val(ax, 'hfRms'), val(ax, 'fbRms'));
+      return r === null ? null : clamp(r);
+    };
+    const velNorm = ax => { const v = val(ax, 'velMm'); return v === null ? null : clamp(v / VEL_ALERT); };
+
+    // each returns { score, feats } or null
+    const FAULT_FN = [
+      // Unbalance
+      ax => {
+        const vN = velNorm(ax); if (vN === null) return null;
+        const hf = hfRatio(ax);
+        const low = hf === null ? 0.5 : 1 - hf;
+        return { score: clamp(0.6 * vN + 0.4 * low), feats: [vN, low] };
+      },
+      // Misalignment
+      ax => {
+        const vN = velNorm(ax); if (vN === null) return null;
+        const axial = val(AXIAL_AXIS, 'velMm');
+        const radial = avg(AXES.filter(a => a !== AXIAL_AXIS).map(a => val(a, 'velMm')));
+        const ratio = safeDiv(axial, radial);
+        const rN = ratio === null ? 0 : clamp(ratio / 1.5);
+        return { score: clamp(0.6 * rN + 0.4 * vN), feats: [rN, vN] };
+      },
+      // Bearing
+      ax => {
+        const k = norm(val(ax, 'hfKurt'), 3, 10);
+        const c = norm(val(ax, 'hfCrest'), 3, 8);
+        const r = hfRatio(ax);
+        if (k === null && c === null && r === null) return null;
+        return { score: clamp(0.4 * (k ?? 0) + 0.35 * (c ?? 0) + 0.25 * (r ?? 0)), feats: [k, c, r] };
+      },
+      // Looseness
+      ax => {
+        const k = norm(val(ax, 'fbKurt'), 3, 8);
+        const c = norm(val(ax, 'fbCrest'), 3, 7);
+        const v = velNorm(ax);
+        if (k === null && c === null && v === null) return null;
+        return { score: clamp(0.35 * (k ?? 0) + 0.30 * (c ?? 0) + 0.35 * (v ?? 0)), feats: [k, c, v] };
+      },
+      // Resonance
+      ax => {
+        const fa = val(ax, 'peakAccFreq'), fv = val(ax, 'peakVelFreq'), v = velNorm(ax);
+        if (v === null) return null;
+        let agr = null;
+        if (fa !== null && fv !== null && Math.max(fa, fv) > 0) agr = 1 - Math.min(1, Math.abs(fa - fv) / Math.max(fa, fv));
+        return { score: clamp(0.4 * (agr ?? 0) + 0.6 * v), feats: [agr, v] };
+      }
+    ];
+
+    function computeFaultProbs() {
+      FAULTS.forEach(f => {
+        f.prob = null; f.axis = { x: null, y: null, z: null };
+        f.features.forEach(fe => fe.val = null);
+      });
+      FAULT_FN.forEach((fn, i) => {
+        const f = FAULTS[i];
+        const scores = [];
+        const acc = f.features.map(() => []);
+        AXES.forEach(ax => {
+          const r = fn(ax);
+          if (!r) return;
+          f.axis[ax] = r.score; scores.push(r.score);
+          r.feats.forEach((v, j) => acc[j].push(v));
+        });
+        if (!scores.length) return;
+        f.prob = Math.min(FAULT_CAP[i], clamp(0.6 * max(scores) + 0.4 * avg(scores)));
+        f.features.forEach((fe, j) => fe.val = avg(acc[j]));
+      });
+    }
+
+    function renderFaults() {
+      computeFaultProbs();
+      const l = document.getElementById('faultL');
+      if (!l) return;
+      l.innerHTML = '';
+      if (!FAULTS.some(f => f.prob !== null)) {
+        l.innerHTML = `<div style="text-align:center;color:#94a3b8;padding:24px 0;font-size:13px">No Data Available</div>`;
+        return;
+      }
+      FAULTS.forEach(f => {
+        const d = document.createElement('div'); d.className = 'fault-item';
+        d.style.borderColor = f.border;
+        const pct = f.prob !== null ? Math.min(99, Math.round(f.prob * 100)) : null;
+        d.innerHTML = `
+          <div style="display:flex;align-items:center;gap:8px">
+            <div style="width:8px;height:8px;border-radius:50%;background:${f.color};flex-shrink:0"></div>
+            <div>
+              <div class="fault-name" style="color:${f.color}">${f.name}</div>
+              <div class="fault-sub">${f.sub}</div>
+            </div>
+          </div>
+          <div class="prob-wrap">
+            <div class="prob-track"><div class="prob-fill" style="width:${pct !== null ? pct : 0}%;background:${f.color}"></div></div>
+            <span class="prob-pct" style="color:${pct !== null ? f.color : '#94a3b8'}">${pct !== null ? pct + '%' : ND}</span>
+          </div>`;
+        d.addEventListener('mouseenter', e => showFaultTip(e, f));
+        d.addEventListener('mouseleave', () => scheduleFaultHide());
+        l.appendChild(d);
+      });
+    }
+
+    // ─────────────────────────────────────
+    // 12. FAULT TOOLTIP
+    // ─────────────────────────────────────
+    const ftEl = document.getElementById('faultTip');
+    let ftHideTimer = null;
+
+    function showFaultTip(e, f) {
+      if (!ftEl) return;
+      clearTimeout(ftHideTimer);
+      const pct = f.prob !== null ? Math.min(99, Math.round(f.prob * 100)) : null;
+
+      document.getElementById('ft-title').textContent = f.name;
+      document.getElementById('ft-sub').textContent = f.sub;
+      document.getElementById('ft-formula').innerHTML =
+        `<div style="margin-bottom:3px;color:#6366f1;font-size:8px">${f.algorithm}</div>` +
+        `<div style="color:#0f172a;font-weight:700">${f.formula}</div>` +
+        `<div style="color:#94a3b8;margin-top:2px">${f.formula_vars}</div>`;
+
+      const fEl = document.getElementById('ft-features'); fEl.innerHTML = '';
+      f.features.forEach(feat => {
+        const pf = feat.val !== null ? Math.round(feat.val * 100) : null;
+        fEl.innerHTML += `
+          <div class="ft-brow">
+            <div class="ft-blbl">
+              <span>${feat.label}</span>
+              <span style="color:${feat.color};font-weight:700">${pf !== null ? pf + '%' : ND}</span>
+            </div>
+            <div class="ft-btrack">
+              <div class="ft-bfill" style="width:${pf !== null ? pf : 0}%;background:${feat.color}"></div>
+            </div>
+          </div>`;
+      });
+
+      const conf = document.getElementById('ft-confidence'); conf.innerHTML = '';
+      const axCol = { x: '#0284c7', y: '#4f46e5', z: '#059669' };
+      const level = pct === null ? 'NO DATA' : pct > 50 ? 'HIGH' : pct > 20 ? 'MEDIUM' : 'LOW';
+      const lvlCol = pct === null ? '#94a3b8' : pct > 50 ? '#ef4444' : pct > 20 ? '#f59e0b' : '#10b981';
+      AXES.forEach(ax => {
+        const s = f.axis && f.axis[ax] !== null && f.axis[ax] !== undefined ? Math.round(f.axis[ax] * 100) + '%' : ND;
+        conf.innerHTML += `<div class="ft-row"><span class="ft-key">${AX_NAME[ax]}-Axis score</span><span class="ft-val" style="color:${axCol[ax]}">${s}</span></div>`;
+      });
+      conf.innerHTML += `<div class="ft-row" style="border-top:1px solid var(--border);padding-top:4px;margin-top:4px">
+        <span class="ft-key">Risk level</span>
+        <span class="ft-val" style="color:${lvlCol}">${level}${pct !== null ? ' (' + pct + '%)' : ''}</span>
+      </div>`;
+
+      document.getElementById('ft-foot').innerHTML =
+        `<span style="color:${f.color};font-weight:700">▶ Recommended: </span>${f.action}`;
+
+      positionFaultTip(e);
+      ftEl.classList.add('vis');
+    }
+
+    function positionFaultTip(e) {
+      if (!ftEl) return;
+      const vw = window.innerWidth, vh = window.innerHeight;
+      let left = e.clientX + 16, top = e.clientY - 20;
+      if (left + 318 > vw) left = e.clientX - 326;
+      if (top + 430 > vh) top = vh - 435;
+      if (top < 10) top = 10;
+      ftEl.style.left = left + 'px'; ftEl.style.top = top + 'px';
+    }
+
+    function scheduleFaultHide() {
+      ftHideTimer = setTimeout(() => { if (ftEl) ftEl.classList.remove('vis'); }, 220);
+    }
+
+    if (ftEl && !ftEl._listenersAdded) {
+      ftEl.addEventListener('mouseenter', () => clearTimeout(ftHideTimer));
+      ftEl.addEventListener('mouseleave', () => scheduleFaultHide());
+      ftEl._listenersAdded = true;
+    }
+
+    // ─────────────────────────────────────
+    // 13. EVENTS LOG + CLOCK
+    // ─────────────────────────────────────
+    function renderEvents() {
+      const log = document.getElementById('evLog');
+      if (!log || log.children.length > 0) return;
+      log.innerHTML = `<div style="text-align:center;color:#94a3b8;padding:16px 0;font-size:12px">No events logged</div>`;
+    }
+
+    function tick() {
+      const clk = document.getElementById('clk');
+      if (clk) clk.textContent = new Date().toUTCString().split(' ').slice(-2, -1)[0] + ' UTC';
+    }
+
+    // ─────────────────────────────────────
+    // 14. RUL COUNTDOWN (still a simulated placeholder – no RUL key available)
+    // ─────────────────────────────────────
+    state.pCd--;
+    if (state.pCd <= 0) {
+      state.pCd = 5;
+      const hasVel = AXES.some(a => val(a, 'velMm') !== null);
+      if (hasVel) {
+        if (state.pRul === null) state.pRul = 847;
+        state.pRul = Math.max(50, state.pRul - 1);
+      }
+      setEl('rulV', state.pRul !== null ? state.pRul : ND);
+      setEl('rulSub', state.pRul !== null
+        ? `≈ ${(state.pRul / 24).toFixed(1)} days · Confidence: ${state.pRul > 500 ? 'HIGH' : state.pRul > 200 ? 'MEDIUM' : 'LOW'}`
+        : 'Insufficient data for prediction');
+      setEl('pCD', `Next ML update in ${state.pCd}s`);
+    }
+
+    // ─────────────────────────────────────
+    // 15. REFRESH on every data update
+    // ─────────────────────────────────────
+    updateKPIs();
+    refreshWave();
+    refreshSpec();
+    refreshTrend();
+    refreshCond();
+    renderFaults();
+    renderEvents();
+    tick();
+
+  }, 10);
+};
