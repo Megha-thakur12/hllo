@@ -1,19 +1,46 @@
 // ═══════════════════════════════════════════════════════════
-//  Vibration / Predictive Maintenance widget
+//  Vibration / Predictive Maintenance widget  (device: Process Aro Pump)
 //  - 5-minute telemetry cadence
-//  - Data ALWAYS stays on screen: live → REST history → local cache
+//  - Data always on screen (history + browser cache)
+//  - Auto-updates on new telemetry (live push + 30 s poll)
+//  - Uses ONLY the keys that exist on the device
 // ═══════════════════════════════════════════════════════════
 
-const DATA_INTERVAL_MS = 5 * 60 * 1000;                     // telemetry every 5 min
-const STALE_AFTER_MS   = 2 * DATA_INTERVAL_MS + 60 * 1000;  // ~11 min => stale
-const HISTORY_RANGE_MS = 7 * 24 * 3600 * 1000;              // look back up to 7 days
-const HISTORY_LIMIT    = 300;                               // latest 300 points per key (~25 h)
-const CACHE_TAIL       = 72;                                // points per key kept in localStorage (~6 h)
+const DATA_INTERVAL_MS = 5 * 60 * 1000;
+const STALE_AFTER_MS   = 2 * DATA_INTERVAL_MS + 60 * 1000;   // ~11 min
+const HISTORY_RANGE_MS = 7 * 24 * 3600 * 1000;
+const HISTORY_LIMIT    = 300;
+const MAX_POINTS       = 400;
+const CACHE_TAIL       = 72;
+const POLL_MS          = 30 * 1000;
+
+// ───────────── series helpers ─────────────
+function cleanRows(rows) {
+  return (rows || [])
+    .filter(e => e && e[1] !== null && e[1] !== undefined && e[1] !== '' && !isNaN(Number(e[1])))
+    .map(e => [e[0], Number(e[1])]);
+}
+
+function mergeSeries(a, b) {
+  const m = new Map();
+  (a || []).forEach(p => m.set(p[0], p[1]));
+  (b || []).forEach(p => m.set(p[0], p[1]));
+  return Array.from(m.entries()).sort((x, y) => x[0] - y[0]).slice(-MAX_POINTS);
+}
+
+function newestOf(store) {
+  let t = 0;
+  Object.keys(store).forEach(k => {
+    const s = store[k];
+    if (s && s.length && s[s.length - 1][0] > t) t = s[s.length - 1][0];
+  });
+  return t;
+}
 
 // ───────────── cache helpers ─────────────
 function cacheKey() {
   const ds = self.ctx.datasources && self.ctx.datasources[0];
-  return 'vib_cache_' + (ds && ds.entityId ? ds.entityId : self.ctx.widget && self.ctx.widget.id || 'w');
+  return 'vib_cache_' + (ds && ds.entityId ? ds.entityId : (self.ctx.widget && self.ctx.widget.id) || 'w');
 }
 
 function loadCache() {
@@ -23,54 +50,61 @@ function loadCache() {
   } catch (e) { return {}; }
 }
 
-function saveCache(map) {
+function saveCache(store) {
   try {
     const out = {};
-    Object.keys(map).forEach(k => {
-      if (map[k] && map[k].length) out[k] = map[k].slice(-CACHE_TAIL);
+    Object.keys(store).forEach(k => {
+      if (store[k] && store[k].length) out[k] = store[k].slice(-CACHE_TAIL);
     });
     localStorage.setItem(cacheKey(), JSON.stringify(out));
-  } catch (e) { /* storage full or blocked: ignore */ }
+  } catch (e) { /* ignore */ }
 }
 
-// ───────────── REST history fallback ─────────────
-function fetchHistory(force) {
-  const now = Date.now();
+// ───────────── REST fetch (initial history + incremental new points) ─────────────
+function fetchTelemetry(initial) {
   if (self.ctx._fetching) return;
-  if (!force && self.ctx._lastFetch && now - self.ctx._lastFetch < DATA_INTERVAL_MS) return;
 
   const ds = self.ctx.datasources && self.ctx.datasources[0];
   if (!ds || !ds.entityId || !ds.entityType || !self.ctx.http) return;
 
-  const keys = (ds.dataKeys || []).map(k => k.name).filter(Boolean);
+  const keys = (ds.dataKeys || [])
+    .map(k => k.name)
+    .filter(n => n && n.toLowerCase() !== 'timestamp');
   if (!keys.length) return;
 
+  const now = Date.now();
+  const known = newestOf(self.ctx._hist || {});
+  const startTs = (!initial && known) ? known + 1 : now - HISTORY_RANGE_MS;
+
   self.ctx._fetching = true;
-  self.ctx._lastFetch = now;
 
   const url = `/api/plugins/telemetry/${ds.entityType}/${ds.entityId}/values/timeseries` +
     `?keys=${encodeURIComponent(keys.join(','))}` +
-    `&startTs=${now - HISTORY_RANGE_MS}&endTs=${now}` +
+    `&startTs=${startTs}&endTs=${now + 60000}` +
     `&limit=${HISTORY_LIMIT}&agg=NONE&orderBy=DESC&useStrictDataTypes=false`;
 
   self.ctx.http.get(url).subscribe(
     resp => {
       self.ctx._fetching = false;
-      const map = {};
+      let added = false;
       Object.keys(resp || {}).forEach(k => {
-        map[k] = (resp[k] || [])
+        const rows = (resp[k] || [])
           .filter(p => p && p.value !== null && p.value !== undefined && p.value !== '' && !isNaN(Number(p.value)))
-          .map(p => [p.ts, Number(p.value)])
-          .sort((a, b) => a[0] - b[0]);
+          .map(p => [p.ts, Number(p.value)]);
+        if (rows.length) {
+          self.ctx._hist[k] = mergeSeries(self.ctx._hist[k], rows);
+          added = true;
+        }
       });
-      self.ctx._fallback = map;
-      console.log('[Vibration widget] history loaded:',
-        Object.keys(map).map(k => `${k} → ${map[k].length} pts`));
-      self.onDataUpdated();            // re-render with the fetched history
+      if (initial) {
+        console.log('[Vibration widget] history loaded:',
+          Object.keys(self.ctx._hist).map(k => `${k} → ${self.ctx._hist[k].length} pts`));
+      }
+      if (added) self.onDataUpdated();
     },
     err => {
       self.ctx._fetching = false;
-      console.warn('[Vibration widget] history fetch failed:', err);
+      console.warn('[Vibration widget] telemetry fetch failed:', err);
     }
   );
 }
@@ -79,11 +113,11 @@ function fetchHistory(force) {
 self.onInit = function () {
 
   if (!self.ctx._rulState) self.ctx._rulState = { pRul: null };
-  self.ctx._cache = loadCache();       // last known data from previous sessions
+  self.ctx._hist = loadCache();
+  self.ctx._lastDataTs = null;
 
   function pad(n) { return n < 10 ? '0' + n : '' + n; }
 
-  // Clock + last-data + countdown. Runs every 1s, independent of data.
   self.ctx._updateStatus = function () {
     const now = Date.now();
 
@@ -101,14 +135,10 @@ self.onInit = function () {
       return;
     }
 
-    const age = now - last;
-    const stale = age > STALE_AFTER_MS;
-    const lastKnown = self.ctx._source && self.ctx._source !== 'live';
+    const stale = (now - last) > STALE_AFTER_MS;
 
     if (lastSync) {
-      let label = stale ? 'Data stale · last: ' : 'Last data: ';
-      if (lastKnown) label = 'Showing last known data · ';
-      lastSync.textContent = label + new Date(last).toLocaleString();
+      lastSync.textContent = (stale ? 'Data stale · last: ' : 'Last data: ') + new Date(last).toLocaleString();
       lastSync.style.color = stale ? '#ef4444' : '';
     }
 
@@ -129,88 +159,64 @@ self.onInit = function () {
   self.ctx._clockTimer = setInterval(self.ctx._updateStatus, 1000);
   self.ctx._updateStatus();
 
-  // Draw cached data immediately, then try to refresh from the server
-  if (Object.keys(self.ctx._cache).length) {
-    setTimeout(() => self.onDataUpdated(), 0);
-  }
-  setTimeout(() => fetchHistory(true), 500);
+  if (Object.keys(self.ctx._hist).length) setTimeout(() => self.onDataUpdated(), 0);
+  setTimeout(() => fetchTelemetry(true), 500);
+
+  if (self.ctx._pollTimer) clearInterval(self.ctx._pollTimer);
+  self.ctx._pollTimer = setInterval(() => fetchTelemetry(false), POLL_MS);
 };
 
 self.onDestroy = function () {
-  if (self.ctx._clockTimer) {
-    clearInterval(self.ctx._clockTimer);
-    self.ctx._clockTimer = null;
-  }
+  if (self.ctx._clockTimer) { clearInterval(self.ctx._clockTimer); self.ctx._clockTimer = null; }
+  if (self.ctx._pollTimer)  { clearInterval(self.ctx._pollTimer);  self.ctx._pollTimer = null; }
 };
 
 // ═══════════════════════════════════════════════════════════
 self.onDataUpdated = function () {
 
+  if (!self.ctx._hist) self.ctx._hist = {};
   const liveData = self.ctx.data || [];
-  if (!liveData.length && !Object.keys(self.ctx._cache || {}).length) return;
-  self.ctx._gotKeys = true;
 
   // ─────────────────────────────────────
-  // 0. BUILD DATA: live → history → cache (per key)
+  // 0. MERGE live points into stored series
   // ─────────────────────────────────────
-  const clean = rows => (rows || [])
-    .filter(e => e && e[1] !== null && e[1] !== undefined && e[1] !== '' && !isNaN(Number(e[1])))
-    .map(e => [e[0], Number(e[1])]);
-
-  const fallback = self.ctx._fallback || {};
-  const cache = self.ctx._cache || {};
-
-  const keyNames = liveData.length
-    ? liveData.map(d => d.dataKey.name || d.dataKey.label)
-    : Object.keys(cache);
-
-  let liveCount = 0, fbCount = 0, cacheCount = 0;
-
-  const result = keyNames.map(name => {
-    const item = liveData.find(d => (d.dataKey.name || d.dataKey.label) === name);
-    const live = item ? clean(item.data) : [];
-    if (live.length) { liveCount++; return { name, data: live }; }
-    if (fallback[name] && fallback[name].length) { fbCount++; return { name, data: fallback[name] }; }
-    if (cache[name] && cache[name].length) { cacheCount++; return { name, data: cache[name] }; }
-    return { name, data: [] };
+  liveData.forEach(d => {
+    const name = d.dataKey.name || d.dataKey.label;
+    if (!name || name.toLowerCase() === 'timestamp') return;
+    const rows = cleanRows(d.data);
+    if (rows.length) self.ctx._hist[name] = mergeSeries(self.ctx._hist[name], rows);
+    else if (!self.ctx._hist[name]) self.ctx._hist[name] = [];
   });
 
-  self.ctx._source = liveCount > 0 && fbCount === 0 && cacheCount === 0 ? 'live'
-                   : liveCount > 0 ? 'mixed'
-                   : fbCount > 0 ? 'history'
-                   : cacheCount > 0 ? 'cache' : 'none';
+  if (!liveData.length && !Object.keys(self.ctx._hist).length) return;
+  self.ctx._gotKeys = true;
 
-  // Live window empty → ask the server for the last known values
-  if (liveCount === 0) fetchHistory(false);
+  const result = Object.keys(self.ctx._hist).map(name => ({ name, data: self.ctx._hist[name] }));
 
-  // Normalised lookup: ignore case, underscores, spaces, dashes
   const norm = s => String(s).toLowerCase().replace(/[^a-z0-9]/g, '');
   const keyIndex = {};
   result.forEach(r => { keyIndex[norm(r.name)] = r; });
 
-  const keySig = result.map(r => r.name + ':' + r.data.length).join('|') + '|' + self.ctx._source;
+  const keySig = result.map(r => r.name + ':' + r.data.length).join('|');
   if (self.ctx._keySig !== keySig) {
     self.ctx._keySig = keySig;
-    console.log(`[Vibration widget] source=${self.ctx._source}; keys:`,
-      result.map(r => `${r.name} → ${r.data.length} pts`));
+    console.log('[Vibration widget] keys:', result.map(r => `${r.name} → ${r.data.length} pts`));
   }
 
   // ─────────────────────────────────────
   // 0b. NEW-DATA DETECTION
   // ─────────────────────────────────────
-  let newestTs = 0;
-  result.forEach(r => r.data.forEach(d => { if (d[0] > newestTs) newestTs = d[0]; }));
-
+  const newestTs = newestOf(self.ctx._hist);
   const prevTs = self.ctx._lastDataTs || null;
   const chartExists = !!document.querySelector('#waveChart .js-plotly-plot, #waveChart.js-plotly-plot');
-  const sourceChanged = self.ctx._renderedSource !== self.ctx._source;
 
   if (newestTs) {
-    if (prevTs === newestTs && chartExists && !sourceChanged) {
+    if (prevTs === newestTs && chartExists) {
       if (self.ctx._updateStatus) self.ctx._updateStatus();
       return;
     }
     self.ctx._lastDataTs = newestTs;
+    saveCache(self.ctx._hist);
   } else {
     if (self.ctx._emptyRendered && chartExists) {
       if (self.ctx._updateStatus) self.ctx._updateStatus();
@@ -218,100 +224,81 @@ self.onDataUpdated = function () {
     }
     self.ctx._emptyRendered = true;
   }
-  self.ctx._renderedSource = self.ctx._source;
-
-  // Save the latest good data for next time (live or history only)
-  if (newestTs && self.ctx._source !== 'cache') {
-    const toSave = {};
-    result.forEach(r => { toSave[r.name] = r.data; });
-    self.ctx._cache = toSave;
-    saveCache(toSave);
-  }
 
   // ─────────────────────────────────────
-  // 1. HELPERS & TELEMETRY KEY MAP
+  // 1. HELPERS & KEY MAP (exact keys from the device)
   // ─────────────────────────────────────
   const missingKeys = new Set();
 
-  function getSeries(names) {
-    const list = Array.isArray(names) ? names : [names];
-    for (const n of list) {
-      const entry = keyIndex[norm(n)];
-      if (entry && entry.data.length) return entry.data;
-    }
-    missingKeys.add(list[0]);
+  function getSeries(name) {
+    const entry = keyIndex[norm(name)];
+    if (entry && entry.data.length) return entry.data;
+    missingKeys.add(name);
     return null;
   }
 
   function parseXY(series) {
-    if (!series || series.length === 0) return { xs: [], ys: [] };
+    if (!series || !series.length) return { xs: [], ys: [] };
     const sorted = [...series].sort((a, b) => a[0] - b[0]);
     return { xs: sorted.map(d => new Date(d[0])), ys: sorted.map(d => Number(d[1])) };
   }
 
-  function latestVal(names) {
-    const s = getSeries(names);
+  function latestVal(name) {
+    const s = getSeries(name);
     if (!s) return null;
-    const { ys } = parseXY(s);
-    if (!ys.length) return null;
-    const val = ys[ys.length - 1];
-    return (val !== null && val !== undefined && !isNaN(val)) ? Number(val) : null;
+    const v = s[s.length - 1][1];
+    return (v !== null && v !== undefined && !isNaN(v)) ? Number(v) : null;
   }
 
-  function latestBool(names) {
-    const v = latestVal(names);
+  function latestBool(name) {
+    const v = latestVal(name);
     return v !== null ? v > 0 : null;
   }
 
-  function getKeyName(axis, metric) {
-    const A = axis.toUpperCase();
-    const a = axis.toLowerCase();
-    const P = `${A}axis`;
-    const keyMap = {
-      'rms_vel':      [`${P}_RMSVel_mm_sec`, `Vibit_${a}_rms_vel`, `${P}_RMSVel`],
-      'peak_acl':     [`${P}_HighFreq_PeakAcc_G`, `Vibit_${a}_peak_acl`],
-      'rms_acl':      [`${P}_HighFreq_RMSAcc_G`, `Vibit_${a}_rms_acl`],
-      'full_rms_acl': [`${P}_FullBand_RMSAcc_G`],
-      'peak_freq':    [`${P}_PeakAcc_Freq_Hz`],
-      'vel_freq':     [`${P}_PeakVel_ComponentFreq_Hz`]
+  // metric → exact telemetry key
+  function K(ax, metric) {
+    const P = ax.toUpperCase() + 'axis';
+    const map = {
+      rms_vel:    `${P}_RMSVel_mm_sec`,
+      rms_vel_in: `${P}_RMSVel_in_sec`,
+      vel_freq:   `${P}_PeakVel_ComponentFreq_Hz`,
+      peak_freq:  `${P}_PeakAcc_Freq_Hz`,
+      full_rms:   `${P}_FullBand_RMSAcc_G`,
+      full_pkpk:  `${P}_FullBand_PkPk_Acc_G`,
+      full_crest: `${P}_FullBand_CrestFactor`,
+      full_kurt:  `${P}_FullBand_Kurtosis`,
+      hf_rms:     `${P}_HighFreq_RMSAcc_G`,
+      hf_peak:    `${P}_HighFreq_PeakAcc_G`,
+      hf_crest:   `${P}_HighFreq_CrestFactor`,
+      hf_kurt:    `${P}_HighFreq_Kurtosis`
     };
-    return keyMap[metric] || [metric];
+    return map[metric];
   }
 
-  const TEMP_KEYS = ['Temperature_C', 'Temperature', 'Temp_C'];
-  const RUN_KEYS  = ['Motor_Run_Flag', 'Motor_Run', 'Run_Flag'];
-  const MAG_KEYS  = ['Magnitude_XYZ_HighFreq_RMSAcc_G'];
+  const TEMP_KEY = 'Temperature_C';
+  const RUN_KEY  = 'Motor_Run_Flag';
+  const MAG_KEY  = 'Magnitude_XYZ_HighFreq_RMSAcc_G';
 
-  const HARM_LABELS = ['1X', '2X', '3X', '4X', '5X', '6X'];
-  const H_FREQ = {
-    x: [25, 50, 75, 100, 125, 150, 175, 200, 225, 250],
-    y: [25, 50, 75, 100, 125, 150, 175, 200, 225, 250],
-    z: [25, 50, 75, 100, 125, 150, 175, 200, 225, 250]
-  };
-
-  function getHarmVal(axis, type, idx) {
-    const n = idx + 1;
-    const A = axis.toUpperCase();
-    const a = axis.toLowerCase();
-    return latestVal([
-      `${A}axis_${type}_amp_${n}x`,
-      `Vibit_${a}_rms_${type}_amp_${n}x`,
-      `Vibit_${a}_${type}_amp_${n}x`
-    ]);
-  }
+  // Axes that actually have data (Z appears automatically if you add Zaxis_* keys)
+  const ALL_AXES = ['x', 'y', 'z'];
+  const AXES = ALL_AXES.filter(ax => {
+    const e = keyIndex[norm(K(ax, 'rms_vel'))];
+    return e && e.data.length;
+  });
+  const AX_COLORS = { x: '#0ea5e9', y: '#6366f1', z: '#10b981' };
+  const AX_NAMES  = { x: 'X-Axis', y: 'Y-Axis', z: 'Z-Axis' };
 
   // ─────────────────────────────────────
   // 2. PLOTLY CONFIG
   // ─────────────────────────────────────
   const PLY_CFG = { responsive: true, displayModeBar: false };
   const PLY_FONT = { family: 'DM Sans, sans-serif', size: 10, color: '#64748b' };
-  const PLY_PAPER = 'rgba(0,0,0,0)';
-  const PLY_PLOT = 'rgba(0,0,0,0)';
+  const TIME_X = { tickformat: '%H:%M', hoverformat: '%d %b %H:%M' };
 
   function baseLayout(extra = {}) {
     return {
-      paper_bgcolor: PLY_PAPER,
-      plot_bgcolor: PLY_PLOT,
+      paper_bgcolor: 'rgba(0,0,0,0)',
+      plot_bgcolor: 'rgba(0,0,0,0)',
       font: PLY_FONT,
       margin: { t: 4, b: 28, l: 40, r: 8 },
       showlegend: false,
@@ -321,16 +308,11 @@ self.onDataUpdated = function () {
     };
   }
 
-  const TIME_X = { tickformat: '%H:%M', hoverformat: '%d %b %H:%M' };
-
   function noDataLayout(extra = {}) {
     return {
       ...baseLayout(extra),
       annotations: [{
-        text: 'No Data Available',
-        xref: 'paper', yref: 'paper',
-        x: 0.5, y: 0.5,
-        showarrow: false,
+        text: 'No Data Available', xref: 'paper', yref: 'paper', x: 0.5, y: 0.5, showarrow: false,
         font: { size: 14, color: '#94a3b8', family: 'DM Sans, sans-serif' }
       }],
       xaxis: { ...baseLayout().xaxis, visible: false },
@@ -339,32 +321,28 @@ self.onDataUpdated = function () {
   }
 
   // ─────────────────────────────────────
-  // 3. WAVEFORM CHART
+  // 3. WAVEFORM CHART (velocity history of selected axis)
   // ─────────────────────────────────────
   let wAxis = self.ctx._wAxis || 'x';
-  const WAVE_COLORS = { x: '#0ea5e9', y: '#6366f1', z: '#10b981' };
 
   function buildWaveData(ax) {
-    const raw = getSeries(getKeyName(ax, 'rms_vel'));
+    const raw = getSeries(K(ax, 'rms_vel'));
     if (!raw) return null;
     const { xs, ys } = parseXY(raw);
     if (!xs.length) return null;
-    const tail = 60; // 60 samples = last 5 hours at 5-min interval
-    const sx = xs.slice(-tail), sy = ys.slice(-tail);
-    const c = WAVE_COLORS[ax];
+    const tail = 60;   // 60 samples = 5 h at 5-min interval
+    const c = AX_COLORS[ax];
     return [{
-      x: sx, y: sy, type: 'scatter', mode: 'lines+markers',
+      x: xs.slice(-tail), y: ys.slice(-tail), type: 'scatter', mode: 'lines+markers',
       line: { color: c, width: 2, shape: 'spline' },
       marker: { size: 4, color: c },
-      fill: 'tozeroy',
-      fillcolor: c + '18',
+      fill: 'tozeroy', fillcolor: c + '18',
       hovertemplate: '%{x|%d %b %H:%M}<br>%{y:.3f} mm/s<extra></extra>'
     }];
   }
 
   function refreshWave() {
-    const el = document.getElementById('waveChart');
-    if (!el) return;
+    if (!document.getElementById('waveChart')) return;
     const traces = buildWaveData(wAxis);
     const extra = {
       xaxis: { ...baseLayout().xaxis, ...TIME_X },
@@ -383,35 +361,39 @@ self.onDataUpdated = function () {
   };
 
   // ─────────────────────────────────────
-  // 4. SPECTRUM CHART
+  // 4. "SPECTRUM" CHART → acceleration levels of selected axis
+  //    (the device has no harmonic keys, so this shows the available levels)
   // ─────────────────────────────────────
   let sAxis = self.ctx._sAxis || 'x';
 
   function buildSpecData(ax) {
-    const amps = HARM_LABELS.map((_, i) => getHarmVal(ax, 'acl', i));
-    if (amps.every(v => v === null)) return null;
-    const freqs = Array.from({ length: 10 }, (_, i) => {
-      const n = i + 1;
-      return latestVal([
-        `${ax.toUpperCase()}axis_rms_acl_freq_${n}x`,
-        `Vibit_${ax}_rms_acl_freq_${n}x`
-      ]) ?? H_FREQ[ax][i];
-    });
-    const c = WAVE_COLORS[ax];
-    const safeAmps = amps.map(v => v ?? 0);
+    const vals = [
+      latestVal(K(ax, 'full_rms')),
+      latestVal(K(ax, 'hf_rms')),
+      latestVal(K(ax, 'hf_peak'))
+    ];
+    if (vals.every(v => v === null)) return null;
+    const pf = latestVal(K(ax, 'peak_freq'));
+    const vf = latestVal(K(ax, 'vel_freq'));
+    const c = AX_COLORS[ax];
     return [{
-      x: HARM_LABELS, y: safeAmps, type: 'bar',
-      marker: { color: safeAmps.map(() => c), opacity: 0.85, line: { color: c, width: 1 } },
-      customdata: freqs,
-      hovertemplate: '<b>%{x}</b><br>Amplitude: %{y:.3f} G<br>Freq: %{customdata} Hz<extra></extra>'
+      x: ['Full-band RMS', 'High-freq RMS', 'High-freq Peak'],
+      y: vals.map(v => v ?? 0),
+      type: 'bar',
+      marker: { color: [c, c, c], opacity: 0.85, line: { color: c, width: 1 } },
+      customdata: [
+        `Peak accel freq: ${pf !== null ? pf.toFixed(1) + ' Hz' : '—'}`,
+        `Peak vel freq: ${vf !== null ? vf.toFixed(1) + ' Hz' : '—'}`,
+        `Peak accel freq: ${pf !== null ? pf.toFixed(1) + ' Hz' : '—'}`
+      ],
+      hovertemplate: '<b>%{x}</b><br>%{y:.3f} G<br>%{customdata}<extra></extra>'
     }];
   }
 
   function refreshSpec() {
-    const el = document.getElementById('specChart');
-    if (!el) return;
+    if (!document.getElementById('specChart')) return;
     const traces = buildSpecData(sAxis);
-    const extra = { yaxis: { ...baseLayout().yaxis, title: { text: 'G RMS', font: { size: 9 } } } };
+    const extra = { yaxis: { ...baseLayout().yaxis, title: { text: 'G', font: { size: 9 } } } };
     Plotly.react('specChart', traces || [], traces ? baseLayout(extra) : noDataLayout(extra), PLY_CFG);
   }
 
@@ -425,24 +407,22 @@ self.onDataUpdated = function () {
   };
 
   // ─────────────────────────────────────
-  // 5. TREND CHART
+  // 5. TREND CHART (velocity history, all available axes)
   // ─────────────────────────────────────
   function buildTrendData() {
-    const axes = ['x', 'y', 'z'];
-    const colors = ['#0ea5e9', '#6366f1', '#10b981'];
-    const names = ['X-Axis', 'Y-Axis', 'Z-Axis'];
     const traces = [];
-    axes.forEach((ax, i) => {
-      const raw = getSeries(getKeyName(ax, 'rms_vel'));
+    AXES.forEach(ax => {
+      const raw = getSeries(K(ax, 'rms_vel'));
       if (!raw) return;
       const { xs, ys } = parseXY(raw);
       if (!xs.length) return;
+      const c = AX_COLORS[ax];
       traces.push({
-        x: xs, y: ys, name: names[i], type: 'scatter', mode: 'lines+markers',
-        line: { color: colors[i], width: 2, shape: 'spline' },
+        x: xs, y: ys, name: AX_NAMES[ax], type: 'scatter', mode: 'lines+markers',
+        line: { color: c, width: 2, shape: 'spline' },
         marker: { size: 4 },
-        fill: 'tozeroy', fillcolor: colors[i] + '10',
-        hovertemplate: `<b>${names[i]}</b>: %{y:.3f} mm/s<extra></extra>`
+        fill: 'tozeroy', fillcolor: c + '10',
+        hovertemplate: `<b>${AX_NAMES[ax]}</b>: %{y:.3f} mm/s<extra></extra>`
       });
     });
     return traces;
@@ -458,67 +438,68 @@ self.onDataUpdated = function () {
   };
 
   function refreshTrend() {
-    const el = document.getElementById('trendChart');
-    if (!el) return;
+    if (!document.getElementById('trendChart')) return;
     const traces = buildTrendData();
     Plotly.react('trendChart', traces, traces.length ? baseLayout(trendExtraLayout) : noDataLayout(trendExtraLayout), PLY_CFG);
   }
 
   // ─────────────────────────────────────
-  // 6. HARMONIC DETAIL CHARTS
+  // 6. DETAIL CHARTS
+  //    harmAclChart → Crest factor (full-band vs high-freq) per axis
+  //    harmVelChart → Kurtosis (full-band vs high-freq) per axis
   // ─────────────────────────────────────
-  function buildHarmData(type) {
-    const axes = ['x', 'y', 'z'];
-    const colors = ['#0ea5e9', '#6366f1', '#10b981'];
-    const names = ['X', 'Y', 'Z'];
-    const traces = [];
-    axes.forEach((ax, i) => {
-      const vals = HARM_LABELS.map((_, j) => getHarmVal(ax, type, j));
-      if (vals.every(v => v === null)) return;
-      traces.push({
-        x: HARM_LABELS,
-        y: vals.map(v => v ?? 0),
-        name: names[i], type: 'bar',
-        marker: { color: colors[i], opacity: 0.8, line: { color: colors[i], width: 1 } },
-        hovertemplate: `<b>${names[i]} %{x}</b>: %{y:.3f}<extra></extra>`
-      });
+  function buildPairChart(fullMetric, hfMetric) {
+    const labels = [], full = [], hf = [];
+    AXES.forEach(ax => {
+      labels.push(ax.toUpperCase());
+      full.push(latestVal(K(ax, fullMetric)) ?? 0);
+      hf.push(latestVal(K(ax, hfMetric)) ?? 0);
     });
-    return traces;
+    if (!labels.length) return [];
+    return [
+      { x: labels, y: full, name: 'Full-band', type: 'bar',
+        marker: { color: '#0ea5e9', opacity: 0.8 }, hovertemplate: '<b>%{x} full-band</b>: %{y:.2f}<extra></extra>' },
+      { x: labels, y: hf, name: 'High-freq', type: 'bar',
+        marker: { color: '#6366f1', opacity: 0.8 }, hovertemplate: '<b>%{x} high-freq</b>: %{y:.2f}<extra></extra>' }
+    ];
   }
 
-  const HARM_LAYOUT = {
-    ...baseLayout(),
-    barmode: 'group',
-    showlegend: true,
-    legend: { orientation: 'h', x: 0, y: 1.12, font: { size: 10 } },
-    margin: { t: 8, b: 28, l: 40, r: 8 },
-    yaxis: { ...baseLayout().yaxis, title: { text: 'Amplitude', font: { size: 9 } } }
-  };
+  function pairLayout(title) {
+    return {
+      ...baseLayout(),
+      barmode: 'group',
+      showlegend: true,
+      legend: { orientation: 'h', x: 0, y: 1.12, font: { size: 10 } },
+      margin: { t: 8, b: 28, l: 40, r: 8 },
+      yaxis: { ...baseLayout().yaxis, title: { text: title, font: { size: 9 } } }
+    };
+  }
 
   function refreshHarmCharts() {
     if (document.getElementById('harmAclChart')) {
-      const aclTraces = buildHarmData('acl');
-      Plotly.react('harmAclChart', aclTraces, aclTraces.length ? { ...HARM_LAYOUT } : noDataLayout(HARM_LAYOUT), PLY_CFG);
+      const t = buildPairChart('full_crest', 'hf_crest');
+      Plotly.react('harmAclChart', t, t.length ? pairLayout('Crest factor') : noDataLayout(pairLayout('Crest factor')), PLY_CFG);
     }
     if (document.getElementById('harmVelChart')) {
-      const velTraces = buildHarmData('vel');
-      Plotly.react('harmVelChart', velTraces, velTraces.length ? { ...HARM_LAYOUT } : noDataLayout(HARM_LAYOUT), PLY_CFG);
+      const t = buildPairChart('full_kurt', 'hf_kurt');
+      Plotly.react('harmVelChart', t, t.length ? pairLayout('Kurtosis') : noDataLayout(pairLayout('Kurtosis')), PLY_CFG);
     }
   }
 
   // ─────────────────────────────────────
-  // 7. HEALTH RING
+  // 7. HEALTH RING (worst-axis velocity, ISO-10816-style bands)
   // ─────────────────────────────────────
   const rC = document.getElementById('ringC');
   const rX = rC ? rC.getContext('2d') : null;
 
+  function worstVel() {
+    const vals = AXES.map(ax => latestVal(K(ax, 'rms_vel'))).filter(v => v !== null);
+    return vals.length ? Math.max(...vals) : null;
+  }
+
   function computeHealth() {
-    const xv = latestVal(getKeyName('x', 'rms_vel'));
-    const yv = latestVal(getKeyName('y', 'rms_vel'));
-    const zv = latestVal(getKeyName('z', 'rms_vel'));
-    const vals = [xv, yv, zv].filter(v => v !== null);
-    if (!vals.length) return null;
-    const worst = Math.max(...vals);
+    const worst = worstVel();
+    if (worst === null) return null;
     if (worst < 2.3) return 95;
     if (worst < 4.5) return 82;
     if (worst < 7.1) return 65;
@@ -553,46 +534,30 @@ self.onDataUpdated = function () {
   // ─────────────────────────────────────
   const ND = '—';
 
-  function setEl(id, val) {
-    const e = document.getElementById(id);
-    if (e) e.textContent = val;
-  }
-
-  function setStyle(id, prop, val) {
-    const e = document.getElementById(id);
-    if (e) e.style[prop] = val;
-  }
+  function setEl(id, val) { const e = document.getElementById(id); if (e) e.textContent = val; }
+  function setStyle(id, prop, val) { const e = document.getElementById(id); if (e) e.style[prop] = val; }
 
   function updateKPIs() {
-    const xv = latestVal(getKeyName('x', 'rms_vel'));
-    const yv = latestVal(getKeyName('y', 'rms_vel'));
-    const zv = latestVal(getKeyName('z', 'rms_vel'));
+    const vel = {}, pk = {};
+    ALL_AXES.forEach(ax => {
+      vel[ax] = latestVal(K(ax, 'rms_vel'));
+      pk[ax]  = latestVal(K(ax, 'hf_peak'));
+    });
 
-    const xp = latestVal(getKeyName('x', 'peak_acl'));
-    const yp = latestVal(getKeyName('y', 'peak_acl'));
-    const zp = latestVal(getKeyName('z', 'peak_acl'));
+    const tmp = latestVal(TEMP_KEY);
+    const running = latestBool(RUN_KEY);
+    const mag = latestVal(MAG_KEY);
 
-    const tmp = latestVal(TEMP_KEYS);
-    const running = latestBool(RUN_KEYS);
-    const magHighFreqAcc = latestVal(MAG_KEYS);
+    ALL_AXES.forEach(ax => {
+      const v = vel[ax];
+      setEl(`k-${ax}v`, v !== null ? v.toFixed(2) : ND);
+      setEl(`k-${ax}vd`, v !== null ? (v > 4.5 ? 'WARN (>4.5)' : 'NORMAL') : 'NO DATA');
+    });
 
-    setEl('k-xv', xv !== null ? xv.toFixed(2) : ND);
-    setEl('k-xvd', xv !== null ? (xv > 4.5 ? 'WARN (>4.5)' : 'NORMAL') : 'NO DATA');
-
-    setEl('k-yv', yv !== null ? yv.toFixed(2) : ND);
-    setEl('k-yvd', yv !== null ? (yv > 4.5 ? 'WARN (>4.5)' : 'NORMAL') : 'NO DATA');
-
-    setEl('k-zv', zv !== null ? zv.toFixed(2) : ND);
-    setEl('k-zvd', zv !== null ? (zv > 4.5 ? 'WARN (>4.5)' : 'NORMAL') : 'NO DATA');
-
-    const peakVals = [xp, yp, zp].filter(v => v !== null);
+    const peakVals = ALL_AXES.map(ax => pk[ax]).filter(v => v !== null);
     if (peakVals.length) {
       setEl('k-pk', Math.max(...peakVals).toFixed(2));
-      setEl('k-pkd',
-        `X:${xp !== null ? xp.toFixed(1) : ND} ` +
-        `Y:${yp !== null ? yp.toFixed(1) : ND} ` +
-        `Z:${zp !== null ? zp.toFixed(1) : ND}`
-      );
+      setEl('k-pkd', ALL_AXES.map(ax => `${ax.toUpperCase()}:${pk[ax] !== null ? pk[ax].toFixed(1) : ND}`).join(' '));
     } else {
       setEl('k-pk', ND);
       setEl('k-pkd', `X:${ND} Y:${ND} Z:${ND}`);
@@ -609,50 +574,41 @@ self.onDataUpdated = function () {
       setStyle('k-ms', 'color', '#94a3b8');
     }
 
-    if (magHighFreqAcc !== null) {
-      setEl('k-noise', `Acc Mag: ${magHighFreqAcc.toFixed(2)} G`);
-      setEl('noiseV', magHighFreqAcc.toFixed(2) + ' G');
+    if (mag !== null) {
+      setEl('k-noise', `Acc Mag: ${mag.toFixed(2)} G`);
+      setEl('noiseV', mag.toFixed(2) + ' G');
+      setStyle('noiseV', 'color', '');
       const noisePin = document.getElementById('noisePin');
-      if (noisePin) noisePin.style.left = Math.min(100, (magHighFreqAcc / 2) * 100) + '%';
+      if (noisePin) noisePin.style.left = Math.min(100, (mag / 2) * 100) + '%';
     } else {
       setEl('k-noise', `Noise: ${ND}`);
       setEl('noiseV', ND);
       setStyle('noiseV', 'color', '#94a3b8');
     }
 
-    setEl('gX', xv !== null ? xv.toFixed(2) : ND);
-    setEl('gY', yv !== null ? yv.toFixed(2) : ND);
-    setEl('gZ', zv !== null ? zv.toFixed(2) : ND);
-
-    const gXf = document.getElementById('gXf');
-    const gYf = document.getElementById('gYf');
-    const gZf = document.getElementById('gZf');
-    if (gXf) gXf.style.width = xv !== null ? Math.min(100, xv * 8.9) + '%' : '0%';
-    if (gYf) gYf.style.width = yv !== null ? Math.min(100, yv * 8.9) + '%' : '0%';
-    if (gZf) gZf.style.width = zv !== null ? Math.min(100, zv * 8.9) + '%' : '0%';
+    ALL_AXES.forEach(ax => {
+      const v = vel[ax];
+      setEl(`g${ax.toUpperCase()}`, v !== null ? v.toFixed(2) : ND);
+      const f = document.getElementById(`g${ax.toUpperCase()}f`);
+      if (f) f.style.width = v !== null ? Math.min(100, v * 8.9) + '%' : '0%';
+    });
 
     drawRing(computeHealth());
     renderSpark();
   }
 
   // ─────────────────────────────────────
-  // 9. SPARKLINE (Temp trend — last 24 samples = 2 hours)
+  // 9. SPARKLINE (temperature, last 24 samples = 2 h)
   // ─────────────────────────────────────
   function renderSpark() {
     const sp = document.getElementById('sparkR');
     if (!sp) return;
     sp.innerHTML = '';
-    const raw = getSeries(TEMP_KEYS);
-    if (!raw) {
-      sp.innerHTML = `<span style="color:#94a3b8;font-size:10px;align-self:center">No Data</span>`;
-      return;
-    }
-    const { ys } = parseXY(raw);
-    const vals = ys.slice(-24);
-    if (!vals.length) {
-      sp.innerHTML = `<span style="color:#94a3b8;font-size:10px;align-self:center">No Data</span>`;
-      return;
-    }
+    const raw = getSeries(TEMP_KEY);
+    const noData = `<span style="color:#94a3b8;font-size:10px;align-self:center">No Data</span>`;
+    if (!raw) { sp.innerHTML = noData; return; }
+    const vals = parseXY(raw).ys.slice(-24);
+    if (!vals.length) { sp.innerHTML = noData; return; }
     const mx = Math.max(...vals, 1);
     vals.forEach(v => {
       const b = document.createElement('div'); b.className = 'spark-b';
@@ -663,140 +619,206 @@ self.onDataUpdated = function () {
   }
 
   // ─────────────────────────────────────
-  // 10. FAULT PREDICTION
+  // 10. FAULT INDICATORS (heuristic, from overall vibration statistics)
   // ─────────────────────────────────────
   if (!self.ctx._rulState) self.ctx._rulState = { pRul: null };
   const state = self.ctx._rulState;
 
   const FAULTS = [
     {
-      name: 'Unbalance', sub: 'Dominant 1X vibration', color: '#f59e0b', border: '#fde68a', prob: null,
-      algorithm: 'Harmonic Dominance Analysis', formula: 'P = A₁X / RMS', formula_vars: 'Higher 1X → higher probability',
-      features: [{ label: '1X / RMS (X,Y,Z avg)', val: null, color: '#f59e0b' }],
-      action: 'Perform rotor balancing'
+      name: 'Unbalance', sub: 'High velocity, low-frequency dominated', color: '#f59e0b', border: '#fde68a',
+      algorithm: 'Velocity Severity × LF Dominance',
+      formula: 'P = Vel severity × (0.5 + 0.5·(1 − HF/Full))',
+      formula_vars: 'Velocity 1.8→7.1 mm/s; HF/Full RMS 0.3→0.8',
+      features: [
+        { label: 'Velocity severity', color: '#f59e0b' },
+        { label: 'LF dominance', color: '#f59e0b' }
+      ],
+      action: 'Check rotor balance'
     },
     {
-      name: 'Misalignment', sub: '2X & 3X harmonics elevated', color: '#ef4444', border: '#fecaca', prob: null,
-      algorithm: 'Harmonic Ratio Analysis', formula: 'P = 0.55·(2X/1X) + 0.35·(3X/1X)', formula_vars: 'Higher harmonic ratios → misalignment',
+      name: 'Misalignment', sub: 'High velocity, uneven across axes', color: '#ef4444', border: '#fecaca',
+      algorithm: 'Velocity + Axis Imbalance',
+      formula: 'P = 0.6·Vel severity + 0.4·(max/min axis ratio)',
+      formula_vars: 'Axis ratio 1.5→4 (needs ≥ 2 axes)',
       features: [
-        { label: '2X / 1X Ratio', val: null, color: '#ef4444' },
-        { label: '3X / 1X Ratio', val: null, color: '#ef4444' }
+        { label: 'Velocity severity', color: '#ef4444' },
+        { label: 'Axis imbalance', color: '#ef4444' }
       ],
       action: 'Inspect shaft alignment & coupling'
     },
     {
-      name: 'Bearing Defect', sub: 'High-frequency vibration energy', color: '#6366f1', border: '#c7d2fe', prob: null,
-      algorithm: 'High-Frequency Energy Analysis', formula: 'P = HF/RMS + Peak/RMS + Harmonic Ratio', formula_vars: 'HF = 4X–6X harmonics',
+      name: 'Bearing Defect', sub: 'Impulsive high-frequency energy', color: '#6366f1', border: '#c7d2fe',
+      algorithm: 'Kurtosis / Crest / HF Ratio',
+      formula: 'P = 0.4·Kurt(HF) + 0.35·Crest(HF) + 0.25·HF/Full',
+      formula_vars: 'Kurtosis 3→8; Crest 3→8; HF/Full 0.4→0.9',
       features: [
-        { label: 'HF Energy / RMS', val: null, color: '#6366f1' },
-        { label: 'Peak / RMS (impact)', val: null, color: '#6366f1' },
-        { label: '4X / 1X Ratio', val: null, color: '#6366f1' }
+        { label: 'HF kurtosis', color: '#6366f1' },
+        { label: 'HF crest factor', color: '#6366f1' },
+        { label: 'HF / Full-band RMS', color: '#6366f1' }
       ],
       action: 'Inspect bearings for wear or damage'
     },
     {
-      name: 'Looseness', sub: 'Multi-harmonic distortion', color: '#0ea5e9', border: '#bae6fd', prob: null,
-      algorithm: 'Multi-Harmonic Distortion', formula: 'P = 2X/1X + 3X/1X + Peak/RMS + 1X/RMS', formula_vars: 'Multiple harmonics + impacts → looseness',
+      name: 'Looseness', sub: 'Impacts and wide peak-to-peak', color: '#0ea5e9', border: '#bae6fd',
+      algorithm: 'Kurtosis / Crest / PkPk Ratio',
+      formula: 'P = 0.4·Kurt(Full) + 0.3·PkPk/RMS + 0.3·Crest(Full)',
+      formula_vars: 'Kurtosis 3→6; PkPk/RMS 4→8; Crest 2.5→5',
       features: [
-        { label: '2X / 1X', val: null, color: '#0ea5e9' },
-        { label: '3X / 1X', val: null, color: '#0ea5e9' },
-        { label: 'Peak / RMS', val: null, color: '#0ea5e9' },
-        { label: '1X / RMS', val: null, color: '#0ea5e9' }
+        { label: 'Full-band kurtosis', color: '#0ea5e9' },
+        { label: 'PkPk / RMS', color: '#0ea5e9' },
+        { label: 'Full-band crest factor', color: '#0ea5e9' }
       ],
       action: 'Check mounting, bolts, and base'
     },
     {
-      name: 'Resonance', sub: 'Frequency amplification', color: '#10b981', border: '#a7f3d0', prob: null,
-      algorithm: 'Frequency Amplification Analysis', formula: 'P = High-frequency amplitude / RMS', formula_vars: 'Amplification near natural frequency',
-      features: [{ label: '4X–5X Energy / RMS', val: null, color: '#10b981' }],
-      action: 'Check structural resonance / speed match'
+      name: 'Overall Severity', sub: 'RMS velocity vs ISO-style limits', color: '#10b981', border: '#a7f3d0',
+      algorithm: 'Velocity Severity',
+      formula: 'P = ramp(worst-axis velocity, 2.8 → 11.2 mm/s)',
+      formula_vars: 'Higher velocity → higher severity',
+      features: [{ label: 'Worst-axis velocity', color: '#10b981' }],
+      action: 'Plan inspection if severity keeps rising'
     }
   ];
 
   function clamp(v, min = 0, max = 1) { return Math.max(min, Math.min(max, v)); }
+  function ramp(v, lo, hi) { return v === null ? null : clamp((v - lo) / (hi - lo)); }
   function safeDiv(a, b) { if (a === null || b === null || b === 0) return null; const v = a / b; return isFinite(v) ? v : null; }
-  function avg(arr) { const valid = arr.filter(v => v !== null); return valid.length ? valid.reduce((a, b) => a + b, 0) / valid.length : null; }
-  function max(arr) { const valid = arr.filter(v => v !== null); return valid.length ? Math.max(...valid) : null; }
+  function avg(arr) { const v = arr.filter(x => x !== null); return v.length ? v.reduce((a, b) => a + b, 0) / v.length : null; }
+  function maxOf(arr) { const v = arr.filter(x => x !== null); return v.length ? Math.max(...v) : null; }
+  function wsum(parts) {   // weighted sum over available parts [[weight, value], ...]
+    const ok = parts.filter(p => p[1] !== null);
+    if (!ok.length) return null;
+    const w = ok.reduce((a, p) => a + p[0], 0);
+    return ok.reduce((a, p) => a + p[0] * p[1], 0) / w;
+  }
+  function combine(scores) {   // 60 % worst axis + 40 % average
+    const m = maxOf(scores), a = avg(scores);
+    return m === null ? null : clamp(0.6 * m + 0.4 * a);
+  }
 
   function computeFaultProbs() {
-    const axes = ['x', 'y', 'z'];
     FAULTS.forEach(f => {
       f.prob = null;
+      f.axisScores = {};
       f.features.forEach(fe => fe.val = null);
     });
 
-    let unbalanceScores = [];
-    axes.forEach(ax => {
-      const h1 = getHarmVal(ax, 'vel', 0);
-      const rms = latestVal(getKeyName(ax, 'rms_vel'));
-      if (h1 !== null && rms !== null) unbalanceScores.push(safeDiv(h1, rms));
+    const F = {};   // per-axis features
+    AXES.forEach(ax => {
+      const full = latestVal(K(ax, 'full_rms'));
+      const hf = latestVal(K(ax, 'hf_rms'));
+      F[ax] = {
+        vel: latestVal(K(ax, 'rms_vel')),
+        hfRatio: safeDiv(hf, full),
+        hfKurt: latestVal(K(ax, 'hf_kurt')),
+        hfCrest: latestVal(K(ax, 'hf_crest')),
+        fullKurt: latestVal(K(ax, 'full_kurt')),
+        fullCrest: latestVal(K(ax, 'full_crest')),
+        pkpkRatio: safeDiv(latestVal(K(ax, 'full_pkpk')), full)
+      };
     });
-    if (unbalanceScores.length) {
-      const finalScore = clamp(0.6 * max(unbalanceScores) + 0.4 * avg(unbalanceScores));
-      FAULTS[0].prob = Math.min(0.98, finalScore);
-      FAULTS[0].features[0].val = avg(unbalanceScores);
-    }
 
-    let misalignScores = [];
-    axes.forEach(ax => {
-      const h1 = getHarmVal(ax, 'vel', 0);
-      const h2 = getHarmVal(ax, 'vel', 1);
-      const h3 = getHarmVal(ax, 'vel', 2);
-      if (h1 !== null) misalignScores.push(0.55 * (safeDiv(h2, h1) ?? 0) + 0.35 * (safeDiv(h3, h1) ?? 0));
-    });
-    if (misalignScores.length) {
-      const finalScore = clamp(0.6 * max(misalignScores) + 0.4 * avg(misalignScores));
-      FAULTS[1].prob = Math.min(0.95, finalScore);
-      FAULTS[1].features[0].val = avg(misalignScores);
-    }
+    const mean = (f, fn) => avg(AXES.map(ax => fn(F[ax])));
 
-    let bearingScores = [];
-    axes.forEach(ax => {
-      const h1 = getHarmVal(ax, 'acl', 0);
-      const h4 = getHarmVal(ax, 'acl', 3);
-      const h5 = getHarmVal(ax, 'acl', 4);
-      const h6 = getHarmVal(ax, 'acl', 5);
-      const rmsAcl = latestVal(getKeyName(ax, 'rms_acl'));
-      const peakAcl = latestVal(getKeyName(ax, 'peak_acl'));
-      if (rmsAcl !== null) {
-        const hfEnergy = avg([h4, h5, h6]);
-        bearingScores.push(0.40 * (safeDiv(hfEnergy, rmsAcl) ?? 0) + 0.35 * (safeDiv(peakAcl, rmsAcl) ?? 0) + 0.25 * (safeDiv(h4, h1 || 1) ?? 0));
+    // Unbalance
+    {
+      const sc = [];
+      AXES.forEach(ax => {
+        const vel = ramp(F[ax].vel, 1.8, 7.1);
+        const lf = F[ax].hfRatio !== null ? 1 - ramp(F[ax].hfRatio, 0.3, 0.8) : null;
+        if (vel === null) return;
+        const s = vel * (0.5 + 0.5 * (lf ?? 0.5));
+        FAULTS[0].axisScores[ax] = s;
+        sc.push(s);
+      });
+      const p = combine(sc);
+      if (p !== null) {
+        FAULTS[0].prob = Math.min(0.98, p);
+        FAULTS[0].features[0].val = mean(F, f => ramp(f.vel, 1.8, 7.1));
+        FAULTS[0].features[1].val = mean(F, f => f.hfRatio !== null ? 1 - ramp(f.hfRatio, 0.3, 0.8) : null);
       }
-    });
-    if (bearingScores.length) {
-      const finalScore = clamp(0.6 * max(bearingScores) + 0.4 * avg(bearingScores));
-      FAULTS[2].prob = Math.min(0.95, finalScore);
-      FAULTS[2].features[0].val = avg(bearingScores);
     }
 
-    let loosenessScores = [];
-    axes.forEach(ax => {
-      const h1 = getHarmVal(ax, 'vel', 0);
-      const h2 = getHarmVal(ax, 'vel', 1);
-      const h3 = getHarmVal(ax, 'vel', 2);
-      const rms = latestVal(getKeyName(ax, 'rms_vel'));
-      const peak = latestVal(getKeyName(ax, 'peak_acl'));
-      if (h1 !== null && rms !== null) {
-        loosenessScores.push(0.35 * (safeDiv(h2, h1) ?? 0) + 0.25 * (safeDiv(h3, h1) ?? 0) + 0.25 * (safeDiv(peak, rms) ?? 0) + 0.15 * (safeDiv(h1, rms) ?? 0));
+    // Misalignment
+    {
+      const vels = AXES.map(ax => F[ax].vel).filter(v => v !== null);
+      let imbalance = null;
+      if (vels.length >= 2 && Math.min(...vels) > 0) imbalance = ramp(Math.max(...vels) / Math.min(...vels), 1.5, 4);
+      const sc = [];
+      AXES.forEach(ax => {
+        const vel = ramp(F[ax].vel, 1.8, 7.1);
+        if (vel === null) return;
+        const s = wsum([[0.6, vel], [0.4, imbalance]]);
+        FAULTS[1].axisScores[ax] = s;
+        sc.push(s);
+      });
+      const p = combine(sc);
+      if (p !== null) {
+        FAULTS[1].prob = Math.min(0.95, p);
+        FAULTS[1].features[0].val = mean(F, f => ramp(f.vel, 1.8, 7.1));
+        FAULTS[1].features[1].val = imbalance;
       }
-    });
-    if (loosenessScores.length) {
-      const finalScore = clamp(0.6 * max(loosenessScores) + 0.4 * avg(loosenessScores));
-      FAULTS[3].prob = Math.min(0.9, finalScore);
-      FAULTS[3].features[0].val = avg(loosenessScores);
     }
 
-    let resonanceScores = [];
-    axes.forEach(ax => {
-      const h4 = getHarmVal(ax, 'vel', 3);
-      const h5 = getHarmVal(ax, 'vel', 4);
-      const rms = latestVal(getKeyName(ax, 'rms_vel'));
-      if (rms !== null) resonanceScores.push(safeDiv(avg([h4, h5]), rms));
-    });
-    if (resonanceScores.length) {
-      const finalScore = clamp(0.6 * max(resonanceScores) + 0.4 * avg(resonanceScores));
-      FAULTS[4].prob = Math.min(0.9, finalScore);
-      FAULTS[4].features[0].val = avg(resonanceScores);
+    // Bearing defect
+    {
+      const sc = [];
+      AXES.forEach(ax => {
+        const s = wsum([
+          [0.40, ramp(F[ax].hfKurt, 3, 8)],
+          [0.35, ramp(F[ax].hfCrest, 3, 8)],
+          [0.25, ramp(F[ax].hfRatio, 0.4, 0.9)]
+        ]);
+        if (s === null) return;
+        FAULTS[2].axisScores[ax] = s;
+        sc.push(s);
+      });
+      const p = combine(sc);
+      if (p !== null) {
+        FAULTS[2].prob = Math.min(0.95, p);
+        FAULTS[2].features[0].val = mean(F, f => ramp(f.hfKurt, 3, 8));
+        FAULTS[2].features[1].val = mean(F, f => ramp(f.hfCrest, 3, 8));
+        FAULTS[2].features[2].val = mean(F, f => ramp(f.hfRatio, 0.4, 0.9));
+      }
+    }
+
+    // Looseness
+    {
+      const sc = [];
+      AXES.forEach(ax => {
+        const s = wsum([
+          [0.40, ramp(F[ax].fullKurt, 3, 6)],
+          [0.30, ramp(F[ax].pkpkRatio, 4, 8)],
+          [0.30, ramp(F[ax].fullCrest, 2.5, 5)]
+        ]);
+        if (s === null) return;
+        FAULTS[3].axisScores[ax] = s;
+        sc.push(s);
+      });
+      const p = combine(sc);
+      if (p !== null) {
+        FAULTS[3].prob = Math.min(0.9, p);
+        FAULTS[3].features[0].val = mean(F, f => ramp(f.fullKurt, 3, 6));
+        FAULTS[3].features[1].val = mean(F, f => ramp(f.pkpkRatio, 4, 8));
+        FAULTS[3].features[2].val = mean(F, f => ramp(f.fullCrest, 2.5, 5));
+      }
+    }
+
+    // Overall severity
+    {
+      const sc = [];
+      AXES.forEach(ax => {
+        const s = ramp(F[ax].vel, 2.8, 11.2);
+        if (s === null) return;
+        FAULTS[4].axisScores[ax] = s;
+        sc.push(s);
+      });
+      const m = maxOf(sc);
+      if (m !== null) {
+        FAULTS[4].prob = Math.min(0.99, m);
+        FAULTS[4].features[0].val = m;
+      }
     }
   }
 
@@ -806,8 +828,7 @@ self.onDataUpdated = function () {
     if (!l) return;
     l.innerHTML = '';
 
-    const anyData = FAULTS.some(f => f.prob !== null);
-    if (!anyData) {
+    if (!FAULTS.some(f => f.prob !== null)) {
       l.innerHTML = `<div style="text-align:center;color:#94a3b8;padding:24px 0;font-size:13px">No Data Available</div>`;
       return;
     }
@@ -872,15 +893,16 @@ self.onDataUpdated = function () {
     });
 
     const conf = document.getElementById('ft-confidence'); conf.innerHTML = '';
-    const axes = [{ ax: 'X', c: '#0284c7' }, { ax: 'Y', c: '#4f46e5' }, { ax: 'Z', c: '#059669' }];
+    const axCol = { x: '#0284c7', y: '#4f46e5', z: '#059669' };
     const confLevel = pct === null ? 'NO DATA' : pct > 50 ? 'HIGH' : pct > 20 ? 'MEDIUM' : 'LOW';
     const confColor = pct === null ? '#94a3b8' : pct > 50 ? '#ef4444' : pct > 20 ? '#f59e0b' : '#10b981';
-    axes.forEach((a, i) => {
-      const contribution = f.features[i]?.val !== null ? Math.round((f.features[i]?.val ?? 0) * 100) : null;
-      conf.innerHTML += `<div class="ft-row"><span class="ft-key">${a.ax}-Axis contribution</span><span class="ft-val" style="color:${a.c}">${contribution !== null ? contribution + '%' : ND}</span></div>`;
+    ALL_AXES.forEach(ax => {
+      const s = f.axisScores ? f.axisScores[ax] : undefined;
+      const txt = (s !== undefined && s !== null) ? Math.round(s * 100) + '%' : ND;
+      conf.innerHTML += `<div class="ft-row"><span class="ft-key">${ax.toUpperCase()}-Axis score</span><span class="ft-val" style="color:${axCol[ax]}">${txt}</span></div>`;
     });
     conf.innerHTML += `<div class="ft-row" style="border-top:1px solid var(--border);padding-top:4px;margin-top:4px">
-      <span class="ft-key">Model confidence</span>
+      <span class="ft-key">Indicator level</span>
       <span class="ft-val" style="color:${confColor}">${confLevel}${pct !== null ? ' (' + pct + '%)' : ''}</span>
     </div>`;
 
@@ -924,30 +946,24 @@ self.onDataUpdated = function () {
   // 13. RUL (placeholder, reduced by real elapsed time between samples)
   // ─────────────────────────────────────
   function updateRUL() {
-    const xv = latestVal(getKeyName('x', 'rms_vel'));
-    const yv = latestVal(getKeyName('y', 'rms_vel'));
-    const zv = latestVal(getKeyName('z', 'rms_vel'));
-    const hasVel = xv !== null || yv !== null || zv !== null;
-
-    if (!hasVel) {
+    if (worstVel() === null) {
       setEl('rulV', ND);
       setEl('rulSub', 'Confidence: NO DATA');
       return;
     }
 
-    if (state.pRul === null) state.pRul = 847;   // placeholder starting RUL (hours)
+    if (state.pRul === null) state.pRul = 847;   // placeholder start (hours)
 
     if (prevTs && newestTs > prevTs) {
-      const elapsedHours = (newestTs - prevTs) / 3600000;
-      state.pRul = Math.max(50, state.pRul - elapsedHours);
+      state.pRul = Math.max(50, state.pRul - (newestTs - prevTs) / 3600000);
     }
 
     setEl('rulV', Math.round(state.pRul));
-    setEl('rulSub', `≈ ${(state.pRul / 24).toFixed(1)} days · Confidence: HIGH`);
+    setEl('rulSub', `≈ ${(state.pRul / 24).toFixed(1)} days · Estimate only`);
   }
 
   // ─────────────────────────────────────
-  // 14. RENDER
+  // 14. RENDER (runs only when a newer sample arrived)
   // ─────────────────────────────────────
   updateRUL();
   updateKPIs();
@@ -962,7 +978,7 @@ self.onDataUpdated = function () {
     const sig = [...missingKeys].join(',');
     if (self.ctx._missingSig !== sig) {
       self.ctx._missingSig = sig;
-      console.warn('[Vibration widget] expected keys not found / empty:', [...missingKeys]);
+      console.warn('[Vibration widget] keys not found / empty:', [...missingKeys]);
     }
   }
 
