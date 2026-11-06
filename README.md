@@ -66,6 +66,7 @@ header::after {
 
 .header-inner {
     display: flex;
+    flex-wrap: wrap;
     align-items: center;
     justify-content: space-between;
     gap: 16px;
@@ -110,6 +111,7 @@ header::after {
 
 .hdr-right {
     display: flex;
+    margin-left: auto;
     align-items: center;
     gap: 10px;
     flex-wrap: wrap;
@@ -238,7 +240,7 @@ main > * {
 /* ================= KPI ================= */
 .kpi-row {
     display: grid;
-    grid-template-columns: repeat(6, minmax(0, 1fr));
+    grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
     gap: 14px;
     margin-bottom: 24px;
 }
@@ -341,14 +343,14 @@ main > * {
 /* ================= GRIDS (same positions as original) ================= */
 .g-main {
     display: grid;
-    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) 370px;
+    grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
     gap: 14px;
     margin-bottom: 24px;
 }
 
 .g-bot {
     display: grid;
-    grid-template-columns: repeat(3, minmax(0, 1fr));
+    grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
     gap: 14px;
     margin-bottom: 24px;
 }
@@ -479,7 +481,7 @@ main > * {
 /* waveform + spectrum fill their card next to the tall prediction card */
 #waveChart,
 #specChart {
-    height: 410px !important;
+    height: 380px !important;
 }
 
 .plotly-chart {
@@ -984,162 +986,19 @@ canvas {
     border-radius: 3px;
 }
 
-/* ================= RESPONSIVE ================= */
-@media(max-width:1500px) {
-    .header-inner {
-        padding: 10px 22px;
-    }
-
-    main {
-        padding: 20px 22px 24px;
-    }
-
-    footer {
-        padding: 12px 22px;
-    }
-
-    .g-main {
-        grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) 340px;
-    }
-
-    .kpi-val {
-        font-size: 26px;
-    }
-
-    .kpi {
-        padding: 14px 15px 12px;
-    }
-}
-
-@media(max-width:1200px) {
-    .g-main {
-        grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
-    }
-
-    .kpi-row {
-        grid-template-columns: repeat(3, minmax(0, 1fr));
-    }
-
-    .kpi-val {
-        font-size: 28px;
-    }
-
-    #waveChart,
-    #specChart {
-        height: 240px !important;
-    }
-}
-
-@media(max-width:800px) {
-    .g-main {
-        grid-template-columns: minmax(0, 1fr);
-    }
-
-    .g-bot {
-        grid-template-columns: minmax(0, 1fr);
-    }
-
-    .kpi-row {
-        grid-template-columns: repeat(2, minmax(0, 1fr));
-        gap: 10px;
-    }
-
-    .header-inner {
-        flex-wrap: wrap;
-        padding: 10px 14px;
-        gap: 10px;
-    }
-
-    .hdr-right {
-        width: 100%;
-        justify-content: flex-start;
-        gap: 8px;
-    }
-
-    .clk {
-        margin-left: auto;
-    }
-
-    .logo {
-        gap: 12px;
-    }
-
-    .logo-icon {
-        padding-right: 12px;
-    }
-
-    .logo-text {
-        font-size: 18px;
-    }
-
-    main {
-        padding: 16px 14px 20px;
-    }
-
-    footer {
-        padding: 10px 14px;
-        flex-direction: column;
-        align-items: flex-start;
-        gap: 4px;
-    }
-
-    .card,
-    .pred-card {
-        padding: 16px;
-    }
-
-    .kpi-val {
-        font-size: 24px;
-    }
-
-    .temp-big {
-        font-size: 40px;
-    }
-
-    #waveChart,
-    #specChart {
-        height: 220px !important;
-    }
-
-    /* harmonic charts row (inline 2-column grid) stacks on phones */
-    main > div:not([class]) {
-        grid-template-columns: 1fr !important;
-    }
-}
-
-@media(max-width:480px) {
-    .logo-text {
-        font-size: 16px;
-    }
-
-    .logo-sub {
-        font-size: 10px;
-        white-space: normal;
-    }
-
-    .pill {
-        padding: 5px 10px;
-        font-size: 9.5px;
-    }
-
-    .kpi {
-        padding: 12px 12px 10px;
-    }
-
-    .kpi-lbl {
-        font-size: 9.5px;
-        letter-spacing: .4px;
-    }
-
-    .kpi-val {
-        font-size: 22px;
-    }
-
-    .prob-track {
-        width: 44px;
-    }
-}
-
+/* logo: fixed size (12vh grew huge on tall screens) */
 img {
     width: 12vh !important
+}
+
+.logo-icon img {
+    width: 110px !important;
+    max-width: 30vw;
+    height: auto !important;
+    display: block;
+}
+
+/* ================= RESPONSIVE (grids adapt to screen width on their own) ================= */
+main > div:not([class]) {
+    grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)) !important;
 }
