@@ -4,7 +4,9 @@
    Breakpoints: 1600 · 1440 · 1200 · 992 · 768 · 520 · 380
    ===================================================================== */
 
-@import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Space+Mono:wght@400;700&display=swap');
+/* Fonts: load DM Sans + Space Mono in the widget HTML (not via @import —
+   ThingsBoard nests widget CSS, which breaks @import and the whole sheet):
+   <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet"> */
 
 /* ---------- DESIGN TOKENS ---------- */
 #container,
@@ -135,12 +137,19 @@
     align-items: center;
     justify-content: center;
     font-size: 19px;
+    overflow: hidden;
 }
 
-.logo-icon img {
-    max-width: 100%;
-    max-height: 100%;
+/* Hard-lock logo size wherever the <img> sits in the header */
+#container .logo-icon img,
+#container .logo img,
+#container header img {
+    width: auto !important;
+    height: auto !important;
+    max-width: 40px !important;
+    max-height: 40px !important;
     object-fit: contain;
+    display: block;
 }
 
 .logo-text {
@@ -1233,6 +1242,13 @@
 /* Phone */
 @media (max-width: 520px) {
     .logo-icon { width: 34px; height: 34px; }
+
+    #container .logo-icon img,
+    #container .logo img,
+    #container header img {
+        max-width: 34px !important;
+        max-height: 34px !important;
+    }
     .logo-text { font-size: 16px; letter-spacing: 2px; }
     .logo-sub { font-size: 8px; letter-spacing: 1.5px; }
 
